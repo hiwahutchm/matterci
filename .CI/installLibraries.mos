@@ -1,0 +1,152 @@
+// adrpo: DO NOT REMOVE ANY LIBS FROM HERE BEFORE REMOVING THEM FROM configs/conf*
+//        usually the newest version will be loaded instead if you remove them!
+//        SO: first remove them from configs/conf* then remove them from here.
+updatePackageIndex();
+if not installPackage(Modelica, "3.1.0", exactMatch=true) then
+    print("Modelica 3.1.0 " + getErrorString() + "\n");
+    exit(1);
+end if;
+for v in {"3.2.1","3.2.2","3.2.3","4.0.0","4.1.0","trunk"} loop
+  if not installPackage(ModelicaTest, v, exactMatch=true) then
+    print("ModelicaTest " + v + " " + getErrorString() + "\n");
+    exit(1);
+  end if;
+end for;
+for v in {"maint.9.1.x", "maint.12.x", "maint.13.x", "master"} loop
+  if not installPackage(Buildings, v) then
+    print("Buildings " + v + " " + getErrorString() + "\n");
+    exit(1);
+  end if;
+end for;
+
+for l in {
+  {"AdvancedNoise", "master"},
+  {"AES", "main"},
+  {"AixLib", "main"},
+  {"Annex60", ""},
+  {"Battery", "main"},
+  {"BenchmarksForResizeableArrays", "main"},
+  {"BidiDCDC", ""},
+  {"BioChem", "master"},
+  {"BikeTrailer", ""},
+  {"BL", "main"},
+  {"BLDC", ""},
+  {"Bodylight", ""},
+  {"BoundaryInitBlocks", "master"},
+  {"BuildingSystems", "master"},
+  {"BuildSysPro", "master"},
+  {"BusinessSimulation", ""},
+  {"BusinessSimulation", "main"},
+  {"ChaoticCircuits", ""},
+  {"Chemical", "1.4.1"},
+  {"Chemical", "master"},
+  {"ClaRa", ""},
+  {"ClaRa", "main"},
+  {"ConPNlib", "master"},
+  {"Credibility", ""},
+  {"DeltaRobot", ""},
+  {"DroneLibrary", ""},
+  {"Dynawo", ""},
+  {"Dynawo", "master"},
+  {"EHPTexamples", ""},
+  {"EHPTexamples", "main"},
+  {"EHPTlib", ""},
+  {"EHPTlib", "main"},
+  {"ElectricalEnergyStorage", "master"},
+  {"ElectricBraking", ""},
+  {"ExtendedPetriNets", ""},
+  {"ExternalMedia",""},
+  {"ExternalMemoryLib", "master"},
+  {"ExternData", "master"},
+  {"FastBuildings", "master"},
+  {"FCSys", "master"},
+  {"FluxTubesExtension","main"},
+  {"Greenhouses", "master"},
+  {"HanserModelica", "master"},
+  {"HelmholtzMedia", "main"},
+  {"IBPSA", "master"},
+  {"IDADistricts", "main"},
+  {"IdealizedContact", "master"},
+  {"IDEAS", ""},
+  {"IDEAS", "master"},
+  {"IndustrialControlSystems", "master"},
+  {"iPSL", ""},
+  {"KeyWordIO", "master"},
+  {"LargeInterfaces", "main"},
+  {"LargeTestSuite", "master"},
+  {"LEPSE", "main"},
+  {"LibRAS", "master"},
+  {"LSGreenH2Production", "main"},
+  {"MagLev", ""},
+  {"MessagePack", ""},
+  {"MEV", "master"},
+  {"Modelica_DeviceDrivers", "master"},
+  {"Modelica_LinearSystems2", "dev"},
+  {"Modelica_LinearSystems2", "master"},
+  {"Modelica_Noise", "master"},
+  {"Modelica_StateGraph2", ""},
+  {"Modelica_Synchronous", "master"},
+  {"ModelicaByExample", "master"},
+  {"ModelicaDataReconciliationSimpleTests", "master"},
+  {"ModelicaTestOverdetermined", "master"},
+  {"NeuralNetwork", "main"},
+  {"OpenHPL", ""},
+  {"ObjectStab", "master"},
+  {"OpenHydraulics", "main"},
+  {"OpenIMDML", "main"},
+  {"OpenIPSL", ""},
+  {"OpenIPSL", "2.0.0"},
+  {"OpenIPSL", "master"},
+  {"Pharmacolibrary", ""},
+  {"PhotoVoltaics_TGM", ""},
+  {"PhotoVoltaics", ""},
+  {"Physiolibrary", "master"},
+  {"Physiomodel", ""},
+  {"Physiomodel", "master"},
+  {"PlanarMechanics", "master"},
+  {"PLL", ""},
+  {"PNlib", "master"},
+  {"PowerGrids",""},
+  {"PowerGrids","develop"},
+  {"PowerSysPro", "master"},
+  {"PowerSystems",""},
+  {"PowerSystems","master"},
+  {"ScalableTestGrids", "master"},
+  {"ScalableTestSuite", "master"},
+  {"SDF", ""},
+  {"SiemensPower",""},
+  {"SiemensPower","OMCtest"},
+  {"SOFCPoliMi","master"},
+  {"SolarTherm", "master"},
+  {"Spot", "master"},
+  {"StewartPlatform",""},
+  {"SystemDynamics", "master"},
+  {"TAeZoSysPro_testsuite", "master"},
+  {"TSP_DataReconciliationSimpleTests", "master"},
+  {"TAeZoSysPro", "master"},
+  {"ThermalSeparation", "master"},
+  {"ThermofluidStream", ""},
+  {"ThermofluidStream", "main"},
+  {"ThermoPower", "master"},
+  {"ThermoPower", "4.0.0-dev"},
+  {"ThermoSysPro", "master"},
+  {"TILMedia", "main"},
+  {"TILMedia_AddOn_Tests", "main"},
+  {"TransiEnt", "master"},
+  {"VehicleInterfaces", "master"},
+  {"URDFModelica", "main"}
+} loop
+  if not installPackage(stringTypeName(l[1]), l[2]) then
+    print(l[1] + " " + l[2] + getErrorString() + "\n");
+    exit(1);
+  end if;
+end for;
+
+print("Did install:" + getErrorString() + "\n");
+
+if not upgradeInstalledPackages() then
+  print("Failed upgrade:\n" + getErrorString() + "\n");
+  exit(1);
+end if;
+
+print("Did upgrade:\n" + getErrorString() + "\n");

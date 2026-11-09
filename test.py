@@ -1,0 +1,1750 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# TODO: When libraries hash changes, run with the old OMC against the new libs
+#       Then run with the new OMC against the new libs
+
+import sys
+if (sys.version_info < (3, 0)):
+  raise Exception("Python2 is no longer supported")
+
+import html, shutil, os, re, glob, time, argparse, datetime, math, platform, traceback, bisect
+from joblib import Parallel, delayed
+import simplejson as json
+import psutil, subprocess, threading, hashlib
+from subprocess import call
+from monotonic import monotonic
+from omcommon import friendlyStr, multiple_replace
+from natsort import natsorted
+from shared import readConfig, getReferenceFileName, simulationAcceptsFlag, isFMPy, isHeavyModel, isExclusiveModel, modelUlimitExe, simulationFlags, alarmGrace
+from platform import processor
+import shared, resultsdb, testservices
+
+import signal
+
+parser = argparse.ArgumentParser(description='OpenModelica library testing tool')
+parser.add_argument('configs', nargs='*')
+parser.add_argument('--branch', default='master')
+parser.add_argument('--fmi', default=False)
+parser.add_argument('--fmuType', default='me', help="FMU type: 'me' for Model Exchange, 'cs' for Co-Simulation, 'me_cs' for both; the interface of configs/fmi-simulators.json then says which one a simulator runs.")
+parser.add_argument('--output', default='')
+parser.add_argument('--docker', default='')
+parser.add_argument('--libraries', help="Directory omc will search in to load system libraries/libraries to test.", default='')
+parser.add_argument('--extraflags', default='')
+parser.add_argument('--extrasimflags', default='')
+parser.add_argument('--ompython_omhome', default='')
+parser.add_argument('--noclean', action="store_true", default=False)
+parser.add_argument('--nobuildmodel', action="store_true", help="Translate, build and simulate in a single simulate() call instead of translateModel() followed by simulate(resimulateExecutable=...), so the JIT compile is reported as build time rather than simulation time. Only used by simCodeTarget=wasm-jit.", default=False)
+parser.add_argument('--coldhot', action="store_true", help="Simulate each model twice in the same omc; the second run reuses the compiled module. Both times are printed, but only the hot one is stored. Only used by simCodeTarget=wasm-jit.", default=False)
+parser.add_argument('--fmisimulator', action='append', default=[], help="FMI simulator to run the FMUs with, as 'name=command' or just the command. Repeat it to simulate every FMU with several tools without building it more than once; the first one stores its results in --branch and each further one in <branch>-<name>, so --branch=master-fmi with OMSimulator and fmpy fills master-fmi and master-fmi-fmpy." )
+parser.add_argument('--wasmfmu', '--wasmjitrunner', action='append', dest='wasmfmu', default=[], help="Export every model once as a wasm FMU (buildModelFMU with fmuType=me_cs, platforms={wasm,<this machine>}, written unzipped) and simulate that one FMU each of these ways: 'me' and 'cs' are its FMI 3.0 interfaces, 'sim' runs the translated model the way simulate() does. Comma-separated or repeated; each one fills <branch>-<name>, so --branch=wasm-jit with me,cs fills wasm-jit-me and wasm-jit-cs, beside the wasm-jit a job without this option fills. See configs/wasm-fmu-runners.json. Only for simCodeTarget=wasm-jit.")
+parser.add_argument('--solver', action='append', default=[], help="Build every model once and simulate it once per solver, so that testing another solver costs a simulation rather than a build. 'default' is the model's own solver and each further name is a -s the simulation is given; comma-separated or repeated. Every solver stores its results in the table its entry names, so --branch=master with default,cvode,gbode fills master, cvode and gbode. See configs/solvers.json.")
+parser.add_argument('--solverflags', default='', help="Simulate every model with the simflags of this configs/solvers.json entry, followed by --extrasimflags so that those can override them. Unlike --solver the results stay in --branch, and it works for every simCodeTarget, wasm-jit included.")
+parser.add_argument('--ulimitvmem', help="Virtual memory limit (in kB) (linux only)", type=int, default=8*1024*1024)
+parser.add_argument('--heavyjobs', help="How many of the models listed in --heavymodels may run at the same time. They are the handful that need gigabytes each, and running sixteen of them together is what takes the machine out of memory.", type=int, default=4)
+parser.add_argument('--heavymodels', help="JSON file naming the models that need gigabytes, as {library: {model: GiB}}. Hand-curated; heavy-models.py proposes what to put in it.", default="configs/heavy-models.json")
+parser.add_argument('--exclusivemodels', help="JSON file naming the models that use a fixed port or other named resource, as {library: {model: resource}}. They run one at a time, whatever their library.", default="configs/exclusive-models.json")
+parser.add_argument('--default', action='append', help="Add a default value for some configuration key, such as --default=ulimitExe=60. The equals sign is mandatory.", default=[])
+parser.add_argument('-j', '--jobs', default=0, help="Ignored and deprecated, use procOMC:0 or procOMC:1 in the config")
+parser.add_argument('-v', '--verbose', action="store_true", help="Verbose mode.", default=False)
+parser.add_argument('--execAllTests', action="store_true", help="Force all tests to be executed", default=False)
+parser.add_argument('--noSync', action="store_true", help="Move files using python instead of rsync", default=False)
+parser.add_argument('--omplot', default='https://playground.openmodelica.org/latest/omplot/', help="OMPlot page a failed verification links to. A relative URL is resolved against the library's report page. The page must be able to fetch the report's files, so use a copy hosted with the report if that is private.")
+parser.add_argument('--timeout', default=0, help="=[value] timeout in seconds for each test, it overrides the timeout calculated by the script")
+parser.add_argument('--msysEnvironment', help = 'MSYS2 environment used by OpenModelica on Windows.',  default = 'ucrt64')
+parser.add_argument('--debug', action="store_true", help="turn on the DEBUG mode", default=False)
+parser.add_argument('--addmsl', action="store_true", help="add the MSL path to the OPENMODELICAPATH if the MSL is not detected in the libraries path", default=False)
+resultsdb.addArgument(parser)
+
+args = parser.parse_args()
+configs = args.configs
+branch = args.branch
+noSync = args.noSync
+isWin = os.name == 'nt'
+DEBUG = args.debug or False # set this to True for debug output
+
+# result location can be on a remote server, do NOT use os.path.abspath on it if the system is not Windows or if --noSync=True
+result_location = ''
+if not isWin and not noSync:
+  result_location = args.output if args.output else ''
+else:
+  result_location = os.path.abspath(args.output) if args.output else ''
+n_jobs = int(args.jobs)
+clean = not args.noclean
+runverbose = args.verbose
+extraflags = args.extraflags
+extrasimflags = " ".join(f for f in (shared.solver(args.solverflags).get("simflags") if args.solverflags else "", args.extrasimflags) if f)
+ompython_omhome = args.ompython_omhome
+fmisimulators = shared.parseFmiSimulators(args.fmisimulator)
+# The first simulator is the one the single-simulator code paths use.
+fmisimulator = fmisimulators[0][1] if fmisimulators else None
+wasmfmurunners = shared.parseWasmFmuRunners(args.wasmfmu)
+solvers = shared.parseSolvers(args.solver)
+if len([x for x in (fmisimulators, wasmfmurunners, solvers) if x]) > 1:
+  raise Exception("--fmisimulator, --wasmfmu and --solver each fan one build out into several "
+                  "result branches; a job runs one of them, not several.")
+# Everything one build is simulated by, whichever of the three it is.
+runnerNames = [n for (n, _) in fmisimulators or wasmfmurunners or solvers]
+
+def branchForRunner(name):
+  if fmisimulators:
+    return shared.branchForSimulator(branch, name)
+  if wasmfmurunners:
+    return shared.branchForWasmFmuRunner(branch, name)
+  return shared.branchForSolver(branch, name)
+
+# One branch per runner, where its own runner belongs: a job given only FMPy on
+# --branch=v1.27-fmi fills v1.27-fmi-fmpy, not v1.27-fmi. Which of them a library
+# is run for is decided per library, see runnersToRun.
+resultBranches = [(branchForRunner(name), name) for name in runnerNames] or [(branch, None)]
+# What the run asks about when it has no library to ask about.
+primaryBranch = resultBranches[0][0]
+
+jobOutput = result_location
+
+def outputFor(resultBranch):
+  """Where a branch publishes.
+
+  --output names the directory of the job, which ends in the branch the job was
+  started with, so every simulator gets the directory of its own branch beside
+  it: a job given only FMPy on --branch=v1.27-fmi publishes v1.27-fmi-fmpy, the
+  same branch its results are stored under.
+
+  rsync runs from the directory a branch is staged in, so a local destination
+  has to be absolute; a remote one, host:path, already is.
+  """
+  location = jobOutput
+  if jobOutput:
+    base = jobOutput.rstrip("/")
+    if base.endswith("/" + branch):
+      location = "%s%s" % (base[:-len(branch)], resultBranch)
+    elif resultBranch != primaryBranch:
+      location = "%s/%s" % (base, resultBranch)
+  if location and ":" not in location.split("/")[0]:
+    location = os.path.abspath(location)
+  return location
+
+
+allTestsFmi = args.fmi
+fmuType = args.fmuType
+ulimitMemory = args.ulimitvmem
+heavyJobs = args.heavyjobs
+# {libname: {model: GiB}}, kept in one hand-curated file rather than spread over
+# the library entries: the same model is heavy in every configuration listing it.
+try:
+  heavyModelsByLibrary = json.load(open(args.heavymodels))
+except IOError:
+  heavyModelsByLibrary = {}
+  print("No %s; every test is scheduled as a light one" % args.heavymodels)
+try:
+  exclusiveModelsByLibrary = json.load(open(args.exclusivemodels))
+except IOError:
+  exclusiveModelsByLibrary = {}
+  print("No %s; tests sharing a port may run at the same time" % args.exclusivemodels)
+docker = args.docker
+addmsl = args.addmsl
+
+numberOfTests = 0
+
+if args.libraries:
+  librariespath = os.path.abspath(os.path.normpath(args.libraries))
+else:
+  if isWin:
+    librariespath = os.path.normpath(os.path.join(os.environ.get('APPDATA'), '.openmodelica', 'libraries'))
+  else:
+    librariespath = os.path.normpath(os.path.join(os.environ.get('HOME'), '.openmodelica', 'libraries'))
+
+# add the MSL path if mslpath=True and the MSL is not found in the libraries path
+MSLpath = ''
+if addmsl and len(glob.glob('Modelica *', root_dir=librariespath)) == 0:
+  if isWin:
+    MSLpath = ';' + os.path.normpath(os.path.join(os.environ.get('APPDATA'), '.openmodelica', 'libraries')).replace('\\','/')
+  else:
+    MSLpath = ':' + os.path.normpath(os.path.join(os.environ.get('HOME'), '.openmodelica', 'libraries'))
+
+overrideDefaults = [arg.split("=", 1) for arg in args.default]
+execAllTests = args.execAllTests
+msysEnvironment = args.msysEnvironment
+
+exeExt = ".exe" if isWin else ""
+customTimeout = int(args.timeout)
+
+pythonExecutable = sys.executable
+if not pythonExecutable:
+  pythonExecutable = "python"
+
+# adds quotes to sorround path elements that contain blank characters - to be used only for Popen calls under Windows
+pythonExecutablePopenWin = os.path.join(*['\"'+i+'\"' if ' ' in i else i+'\\' if ':' in i else i for i in pythonExecutable.split('\\')]) if isWin else ''
+
+def fflush():
+  sys.stdout.flush()
+  sys.stderr.flush()
+
+def check_output_log(*popenargs, **kwargs):
+  if DEBUG:
+    print("run: check_output", popenargs, kwargs)
+    print("\n")
+    fflush()
+  return subprocess.check_output(*popenargs, **kwargs)
+
+def check_call_log(*popenargs, **kwargs):
+  if DEBUG:
+    print("run: check_call", popenargs, kwargs)
+    print("\n")
+    fflush()
+  return subprocess.check_call(*popenargs, **kwargs)
+
+def rmtree(f):
+  try:
+    shutil.rmtree(f)
+  except UnicodeDecodeError:
+    # Yes, we can get UnicodeDecodeError because shutil.rmtree is poorly implemented
+    check_call_log(["rm", "-rf", f], stderr=subprocess.STDOUT)
+
+def print_linenum(signum, frame):
+  print("Currently at line", frame.f_lineno)
+
+if not isWin:
+  signal.signal(signal.SIGUSR1, print_linenum)
+
+if isWin or noSync:
+  # delete temporary ./files to avoid moving of old results (win does not use rsync)
+  try:
+    rmtree("./files")
+    print("Cleaned files directory")
+  except OSError:
+    pass
+  try:
+    os.mkdir("files")
+  except OSError:
+    pass
+  print("Created files directory")
+  sys.stdout.flush()
+
+def killTree(pid, sig):
+  """Signal a process and everything it started; on Windows the shell the command
+  runs in is a process of its own, and killing it leaves the command running."""
+  try:
+    procs = [psutil.Process(pid)] + psutil.Process(pid).children(recursive=True)
+  except psutil.Error:
+    return
+  for process in procs:
+    try:
+      os.kill(process.pid, sig)
+    except (OSError, psutil.Error):
+      pass
+
+def descendantPids(pid):
+  """Everything below that process, right now.
+
+  OMPython starts omc in a session of its own, so signalling the process group
+  does not reach it, and once testmodel.py is dead nothing names it any more:
+  ask before killing the parent, kill after.
+  """
+  try:
+    return [p.pid for p in psutil.Process(pid).children(recursive=True)]
+  except psutil.Error:
+    return []
+
+def killPids(pids, sig):
+  for pid in pids:
+    try:
+      os.kill(pid, sig)
+    except OSError:
+      pass
+
+def jobProcesses(name):
+  """Every process started for that test, whoever its parent is by now.
+
+  testmodel.py runs with OMLT_JOB=<name> in its environment and everything it
+  starts inherits it, so this finds an omc that was reparented to init as well.
+  About 3 ms per scan."""
+  if isWin:
+    return []
+  marker = ("OMLT_JOB=%s" % name).encode() + b"\0"
+  found = []
+  for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+      continue
+    try:
+      with open("/proc/%s/environ" % entry, "rb") as fp:
+        if marker in fp.read():
+          found.append(int(entry))
+    except OSError:
+      pass
+  return found
+
+def processLine(pid):
+  try:
+    p = psutil.Process(pid)
+    return "%d (%s, %.0f MB) %s" % (pid, p.status(), p.memory_info().rss/1e6, " ".join(p.cmdline())[:200])
+  except psutil.Error:
+    return str(pid)
+
+def isAlive(pid):
+  try:
+    return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+  except psutil.Error:
+    return False
+
+leakedJobs = []
+
+def killLeftovers(name):
+  """Kill what a finished test left running and note it in its .err file."""
+  pids = jobProcesses(name)
+  if not pids:
+    return
+  lines = [processLine(pid) for pid in pids]
+  killPids(pids, shared.SIGKILL)
+  deadline = monotonic() + 5
+  while monotonic() < deadline and any(isAlive(pid) for pid in pids):
+    time.sleep(0.1)
+  leakedJobs.append(name)
+  with open(os.path.normpath("files/%s.err" % name), "a+") as errfile:
+    errfile.write("Processes still running after the test, killed:\n  %s\n" % "\n  ".join(lines))
+
+def runCommand(cmd, prefix, timeout):
+  process = [None]
+  def target():
+    if DEBUG:
+      print("run: Popen %s, %s, %d\n" %(cmd, prefix, timeout))
+      fflush()
+    with open(os.devnull, 'w')  as FNULL:
+      if isWin:
+        process[0] = subprocess.Popen(cmd, shell=True, stdin=FNULL, stdout=FNULL, stderr=FNULL)
+      else:
+        process[0] = subprocess.Popen(cmd, shell=True, stdin=FNULL, stdout=FNULL, stderr=FNULL, preexec_fn=os.setpgrp)
+
+      while process[0].poll() is None:
+        process[0].communicate(1)
+        process[0].wait(1)
+
+
+  thread = threading.Thread(target=target, daemon=True)
+  thread.start()
+  thread.join(timeout)
+
+  gotTimeout = False
+
+  if thread.is_alive():
+    gotTimeout = True
+    strays = [] if isWin else descendantPids(process[0].pid)
+    if isWin:
+      killTree(process[0].pid, signal.SIGTERM)
+    else:
+      os.kill(-process[0].pid, signal.SIGTERM)
+    thread.join(min(10, timeout))
+    if thread.is_alive():
+      if isWin:
+        killTree(process[0].pid, shared.SIGKILL)
+      else:
+        os.kill(-process[0].pid, shared.SIGKILL)
+    thread.join(10)
+    # For when testmodel.py did not get far enough into its SIGTERM to do this.
+    killPids(strays, shared.SIGKILL)
+
+  if clean:
+    try:
+      lines = open("%s.tmpfiles" % prefix).readlines()
+    except:
+      lines = []
+    for suffix in [".so",".mos","",".o",".h",".c",".cpp","_info.json",".xml",".tmpfiles",".pipe",".tmpfiles",".libs",".log"]:
+      for f in glob.glob(prefix+suffix):
+        lines.append(f)
+      for f in glob.glob("OM"+prefix+suffix):
+        lines.append(f)
+    for line in lines:
+      f = line.strip()
+      if os.path.isdir(f):
+        rmtree(f)
+      elif os.path.exists(f):
+        os.unlink(f)
+    try:
+      rmtree(prefix)
+    except OSError:
+      pass
+
+  return 1 if gotTimeout else process[0].returncode
+
+try:
+  check_output_log([pythonExecutable, "testmodel.py", "--help"], stderr=subprocess.STDOUT)
+
+except subprocess.CalledProcessError as e:
+  print("Sanity check failed (./testmodel.py --help):\n" + e.output.decode())
+  sys.exit(1)
+
+# how many jobs in parallel?
+n_cores = psutil.cpu_count(logical=False)
+if n_jobs == 0:
+  n_jobs = n_cores
+
+print("branch: %s, n_jobs: %d" % (branch, n_jobs))
+
+if clean:
+  print("Removing temporary files, etc to the best ability of the script")
+
+if not librariespath:
+  print("Error: --libraries is a mandatory argument")
+  sys.exit(1)
+
+if docker:
+  print("###")
+  print("###")
+  print("Warning: Using docker to run this will fail. It is not fully working and needs to be reworked to use docker exec instead of docker run")
+  print("###")
+  print("###")
+  dir_path = os.path.normpath(os.path.dirname(os.path.realpath(__file__)))
+  check_output_log(["docker", "pull", docker], stderr=subprocess.STDOUT).strip()
+  dockerExtraArgs = ["-w", dir_path, "-v", "%s:%s" % (dir_path,dir_path), "--env", "OPENMODELICALIBRARY=%s" % "/usr/lib/omlibrary", "--env", "GC_MARKERS=1", "-v", "%s:/usr/lib/omlibrary" % librariespath]
+  commands = ["docker", "run", "--user", str(os.getuid())] + dockerExtraArgs + [docker]
+  omc_cmd = commands + ["omc"]
+else:
+  commands = []
+  dockerExtraArgs = []
+  if os.environ.get("OPENMODELICAHOME"):
+    omc_cmd = [os.path.normpath(os.path.join(os.environ.get("OPENMODELICAHOME"), 'bin', 'omc'))]
+  else:
+    omc_cmd = ["omc"]
+if result_location != "" and not os.path.exists(outputFor(primaryBranch)):
+  os.makedirs(outputFor(primaryBranch))
+
+if configs == []:
+  print("Error: Expected at least one configuration file to start the library test")
+  sys.exit(1)
+
+from OMPython import OMCSession, OMCSessionZMQ
+
+# Try to make the processes a bit nicer...
+os.environ["GC_MARKERS"]="1"
+
+print("Start OMC version")
+
+if ompython_omhome != "":
+  # Use a different OMC for running OMPython than for running the tests
+  omhome = os.environ["OPENMODELICAHOME"]
+  omc_version = check_output_log(omc_cmd + ["--version"], stderr=subprocess.STDOUT).decode("ascii").strip()
+  os.environ["OPENMODELICAHOME"] = ompython_omhome
+  omc = OMCSessionZMQ()
+  ompython_omc_version=omc.sendExpression('getVersion()')
+  os.environ["OPENMODELICAHOME"] = omhome
+else:
+  omc = OMCSessionZMQ(docker=docker, dockerExtraArgs=dockerExtraArgs)
+  omhome=omc.sendExpression('getInstallationDirectoryPath()')
+  omc_version=omc.sendExpression('getVersion()')
+  ompython_omc_version=omc_version
+ompython_omc_version=ompython_omc_version.replace("OMCompiler","").strip()
+
+def timeSeconds(f):
+  return html.escape("%.2f" % f)
+
+if not docker:
+  omc.sendExpression('setModelicaPath("%s")' % (librariespath.replace('\\','/') + MSLpath,))
+omc_exe=os.path.normpath(os.path.join(omhome,"bin","omc"))
+dygraphs=""
+for p in os.path.normpath(os.path.join(ompython_omhome or omhome,"share","doc","omc","testmodels","dygraph-combined.js")):
+    if os.path.exists(dygraphs): # docker images strip /usr/share/doc from the image...
+        dygraphs = p
+print(omc_exe,omc_version,dygraphs)
+
+sys.stdout.flush()
+
+# Do feature checks. Handle things like old RML-style arguments...
+
+check_output_log(omc_cmd + ["-n=1", "--version"], stderr=subprocess.STDOUT).strip()
+
+sys.stdout.flush()
+
+def fmiSimulatorVersion(name, command):
+  versionArgument = shared.fmiSimulator(name)["versionArgument"]
+  try:
+    if not isFMPy(command):
+      return check_output_log([command, versionArgument], stderr=subprocess.STDOUT).strip()
+    return subprocess.getoutput(command + " " + versionArgument).strip().encode('ascii')
+  except subprocess.CalledProcessError as e:
+    print("Failure to run %s:\n%s" % (command, e.output))
+    raise e
+
+fmisimulatorversions = {}
+fmisimulatorversion = None
+if fmisimulator and any(not isFMPy(command) for (_, command) in fmisimulators):
+  # OMSimulator keeps flags such as --tempDir in this file and never rewrites
+  # one it cannot parse, which it then warns about in every simulation.
+  omsSettings = os.path.join(os.path.expanduser("~"), ".omsimulator", "settings.json")
+  if os.path.exists(omsSettings):
+    os.remove(omsSettings)
+if fmisimulator:
+  for (name, command) in fmisimulators:
+    fmisimulatorversions[name] = fmiSimulatorVersion(name, command)
+    print("%s: %s" % (name, fmisimulatorversions[name]))
+  # The version of the first one goes into the library version of every branch,
+  # as it did when a job ran a single simulator.
+  fmisimulatorversion = fmisimulatorversions[fmisimulators[0][0]]
+else:
+  if allTestsFmi:
+    raise Exception("No OMSimulator; trying to simulate using FMI")
+  print("No OMSimulator")
+
+sys.stdout.flush()
+
+try:
+  os.unlink("HelloWorld"+exeExt)
+except OSError:
+  pass
+check_output_log(omc_cmd + ["--simCodeTarget=Cpp", "HelloWorld.mos"], stderr=subprocess.STDOUT)
+if os.path.exists("HelloWorld"+exeExt):
+  print("Have C++ HelloWorld simulation executable")
+  haveCppRuntime=simulationAcceptsFlag("", isWin=isWin)
+  if haveCppRuntime:
+    print("Have C++ runtime")
+  else:
+    print("C++ HelloWorld simulation executable failed to run")
+else:
+  haveCppRuntime=False
+  print("No C++ runtime")
+
+sys.stdout.flush()
+
+try:
+  check_output_log(omc_cmd + ["Architecture.mo"], stderr=subprocess.STDOUT)
+except subprocess.CalledProcessError:
+  print("Patching ModelicaServices for Architecture bug...")
+  for f in glob.glob(librariespath + os.path.normpath("/ModelicaServices*/package.mo")) + glob.glob(omhome + os.path.normpath("/Modelica */Constants.mo")):
+    with open(f) as fin:
+      content = fin.read()
+    assert(len(content) > 0)
+    content = content.replace("OpenModelica.Internal.Architecture.integerMax()","2147483647")
+    assert(len(content) > 0)
+    with open(f, "w") as fout:
+      open(f,"w").write(content)
+  print("Done patching ModelicaServices...")
+
+sys.stdout.flush()
+
+defaultCustomCommands = []
+if extraflags:
+  defaultCustomCommands += [extraflags]
+
+def testHelloWorld(cmd):
+  with open("HelloWorld.mos") as fin:
+    helloWorldContents = fin.read()
+  try:
+    os.unlink("HelloWorld"+exeExt)
+  except OSError:
+    pass
+  open("HelloWorld.cmd.mos","w").write(cmd + "\n" + helloWorldContents)
+  try:
+    out=check_output_log(omc_cmd + ["HelloWorld.cmd.mos"], stderr=subprocess.STDOUT)
+    if os.path.exists("HelloWorld"+exeExt) and not "Error:" in out.decode():
+      return True
+  except subprocess.CalledProcessError as e:
+    pass
+  return False
+
+for cmd in [
+  'setCommandLineOptions("-d=nogen");',
+  'setCommandLineOptions("-d=initialization");',
+  'setCommandLineOptions("-d=backenddaeinfo");',
+  'setCommandLineOptions("-d=discreteinfo");',
+  'setCommandLineOptions("-d=stateselection");',
+  'setCommandLineOptions("-d=execstat");',
+  'setMatchingAlgorithm("PFPlusExt");',
+  'setIndexReductionMethod("dynamicStateSelection");'
+]:
+  if testHelloWorld(cmd):
+    defaultCustomCommands.append(cmd)
+
+canChangeOptLevel = False
+if testHelloWorld("flags:=getCFlags();setCFlags(flags+\" -O1\");"):
+  canChangeOptLevel = True
+else:
+  print("Cannot change optimization level")
+
+fmiOK_C = False
+fmiOK_Cpp = False
+if allTestsFmi:
+  try:
+    out=check_output_log(omc_cmd + ["--simCodeTarget=C", "FMI.mos"], stderr=subprocess.STDOUT)
+    if os.path.exists("HelloWorldX.fmu") and not "Error:" in out.decode():
+      fmiOK_C = True
+      print("C FMU OK")
+    else:
+      print("No C-based FMUs (files not generated in correct location)")
+  except subprocess.CalledProcessError as e:
+    pass
+  try:
+    out=check_output_log(omc_cmd + ["--simCodeTarget=Cpp", "FMI.mos"], stderr=subprocess.STDOUT)
+    if os.path.exists("HelloWorldX.fmu") and not "Error:" in out.decode():
+      fmiOK_Cpp = True
+      print("C++ FMU OK")
+    else:
+      print("No C++-based FMUs (files not generated in correct location)")
+  except subprocess.CalledProcessError as e:
+    pass
+
+try:
+  os.unlink("HelloWorld"+exeExt)
+except OSError:
+  pass
+print(check_output_log(omc_cmd + ["HelloWorld.mos"], stderr=subprocess.STDOUT).decode().strip())
+assert(os.path.exists("HelloWorld"+exeExt))
+abortSimulationFlag="-abortSlowSimulation" if simulationAcceptsFlag("-abortSlowSimulation", isWin=isWin) else ""
+alarmFlag="-alarm" if simulationAcceptsFlag("-alarm=480", isWin=isWin) else ""
+
+configs_lst = [readConfig(c, abortSimulationFlag=abortSimulationFlag, alarmFlag=alarmFlag, overrideDefaults=overrideDefaults, defaultCustomCommands=defaultCustomCommands, extrasimflags=extrasimflags) for c in configs]
+configs = []
+preparedReferenceDirs = {}
+for c in configs_lst:
+  configs = configs + c
+for (lib,c) in configs:
+  if "referenceFiles" in c:
+    c["referenceFilesURL"] = c["referenceFiles"]
+    if isinstance(c["referenceFiles"], (str, bytes)):
+      m = re.search("^[$][A-Z_]+", c["referenceFiles"])
+      if m:
+        k = m.group(0)[1:]
+        if k not in os.environ:
+          raise Exception("Environment variable %s not defined, but used in JSON config for reference files" % k)
+        c["referenceFiles"] = c["referenceFiles"].replace(m.group(0), os.environ[k])
+    elif "giturl" in c["referenceFiles"]:
+      refFilesGitTag = "origin/master"
+      if "git-ref" in c["referenceFiles"]:
+        refFilesGitTag = c["referenceFiles"]["git-ref"].strip()
+        if not refFilesGitTag.startswith("origin/"):
+          refFilesGitTag = 'origin/%s' % refFilesGitTag
+      # Several libraries share one set of reference files. The first of them
+      # prepares the directory and the rest take what it recorded - but the rest
+      # of this loop still has to run for every one of them.
+      destination = os.path.normpath(c["referenceFiles"]["destination"])
+      if destination in preparedReferenceDirs:
+        (c["referenceFiles"],c["referenceFilesURL"]) = preparedReferenceDirs[destination]
+      else:
+        giturl = c["referenceFiles"]["giturl"]
+        if DEBUG:
+          print("destination %s" % destination)
+          print("not os.path.isdir(destination): %s" % (not os.path.isdir(destination)))
+        destinationReal = os.path.realpath(destination)
+        if DEBUG:
+          print("destinationReal %s" % destinationReal)
+        destinationReal = os.path.normpath(destinationReal)
+        if DEBUG:
+          print("normalized destinationReal %s" % destinationReal)
+          print("referenceFiles:", c["referenceFiles"])
+
+        if not os.path.isdir(destination):
+          if "git-directory" in c["referenceFiles"]:
+            # Sparse clone
+            os.makedirs(destination)
+            check_call_log(["git", "init"], stderr=subprocess.STDOUT, cwd=destinationReal)
+            check_call_log(["git", "remote", "add", "-f", "origin", giturl], stderr=subprocess.STDOUT, cwd=destinationReal)
+            check_call_log(["git", "config", "core.sparseCheckout", "true"], stderr=subprocess.STDOUT, cwd=destinationReal)
+            file = open(os.path.join(destinationReal,".git", "info", "sparse-checkout"), "a")
+            file.write(c["referenceFiles"]["git-directory"].strip())
+            file.close()
+          else:
+            # Clone
+            check_call_log(["git", "clone", giturl, destination], stderr=subprocess.STDOUT)
+
+        check_call_log(["git", "clean", "-fdx", "--exclude=*.hash"], stderr=subprocess.STDOUT, cwd=destinationReal)
+        check_call_log(["git", "fetch", "origin"], stderr=subprocess.STDOUT, cwd=destination)
+        # do not fail if the branch we were given doesn't exist
+        try:
+          check_call_log(["git", "reset", "--hard", refFilesGitTag], stderr=subprocess.STDOUT, cwd=destinationReal)
+        except subprocess.CalledProcessError as e:
+          print(e.output)
+        check_call_log(["git", "clean", "-fdx", "--exclude=*.hash"], stderr=subprocess.STDOUT, cwd=destinationReal)
+        if glob.glob(destinationReal + "/*.mat.xz"):
+          check_call_log(["find", ".", "-name", "*.mat.xz", "-exec", "xz", "--decompress", "--keep", "{}", ";"], stderr=subprocess.STDOUT, cwd=destinationReal)
+        try:
+          githash = check_output_log(["git", "rev-parse", "--verify", "HEAD"], stderr=subprocess.STDOUT, cwd=destinationReal, encoding='utf8')
+        except subprocess.CalledProcessError as e:
+          print(e.output)
+
+        if "git-directory" in c["referenceFiles"]:
+          c["referenceFiles"] = os.path.join(destinationReal, c["referenceFiles"]['git-directory'])
+          print(c["referenceFiles"])
+        else:
+          c["referenceFiles"] = destinationReal
+
+        if giturl.startswith("https://github.com"):
+          c["referenceFilesURL"] = '<a href="%s/tree/%s">%s (%s)</a>' % (giturl, githash.strip(), giturl, githash.strip())
+        else:
+          c["referenceFilesURL"] = "%s (%s)" % (giturl, githash.strip())
+        preparedReferenceDirs[destination] = (c["referenceFiles"],c["referenceFilesURL"])
+    else:
+      raise Exception("Unknown referenceFiles in config: %s" % (str(c["referenceFiles"])))
+
+
+  if allTestsFmi:
+    c["fmi"] = "2.0"
+
+# Create mos-files
+
+db = resultsdb.connect(args.db)
+cursor = db.cursor()
+# One table per simulator, so this happens once per branch the run fills.
+db.createTables(primaryBranch)
+
+def strToHashInt(s):
+  return int(hashlib.sha1((s+"fixCorruptBuilds-2017-03-26").encode("utf-8")).hexdigest()[0:8],16)
+
+def findAllFiles(d):
+  res = []
+  for root, dirs, files in os.walk(d):
+    if "/." in root:
+      continue
+    res += [os.path.join(root, f) for f in files if f[0]!="."]
+  return res
+
+def getmd5(f):
+  hf = os.path.normpath(f+".hash")
+  if not os.path.exists(hf) or (os.path.getmtime(f) > os.path.getmtime(hf)):
+    with open(hf, "w") as fout:
+      with open(f, "rb") as fin:
+        fout.write(hashlib.sha512(fin.read()).hexdigest())
+  with open(hf) as fin:
+    return fin.read()
+
+
+def hashReferenceFiles(s):
+  if s=="":
+    return s
+  files = [f for f in findAllFiles(s) if (not f.endswith(".hash"))]
+  files = sorted(files)
+  res = "".join([getmd5(f) for f in files])
+  return res+"fixCorruptBuilds-2017-06-21"
+
+def haveResultsFor(resultBranch, libName, conf):
+  """The newest run of that library in that branch, or None when there is none."""
+  return cursor.execute("""SELECT date,libversion,libname,branch,omcversion FROM libversion NATURAL JOIN omcversion
+  WHERE libversion=? AND libname=? AND branch=? AND omcversion=? AND confighash=? ORDER BY date DESC LIMIT 1""",
+                        (conf["libraryLastChange"], libName, resultBranch, omc_version, conf["confighash"])).fetchone()
+
+def runnersToRun(libName, conf):
+  """The runners of the job that still owe this library its results.
+
+  The branches are not filled at the same rate - master is tested twice a day,
+  cvode and gbode once a week, ida now and then - so a library with anything
+  left to do is built again and simulated only by the runners missing it.
+  """
+  return [name for (resultBranch, name) in resultBranches
+          if execAllTests or haveResultsFor(resultBranch, libName, conf) is None]
+
+def restrictRunners(conf, names):
+  """Tell testmodel.py which runners of the job this library is to be run by."""
+  if fmisimulators:
+    chosen = [(n, c) for (n, c) in fmisimulators if n in names]
+    conf["fmisimulator"] = chosen[0][1]
+    conf["fmisimulators"] = ["%s=%s" % (n, c) for (n, c) in chosen]
+  elif wasmfmurunners:
+    conf["wasmfmurunners"] = names
+  elif solvers:
+    conf["solvers"] = names
+
+def ranRunner(libname, runner):
+  """Whether the run owed that library the results of that runner."""
+  return runner is None or runner in stats_by_libname[libname]["runners"]
+
+def simulatorKey(libname, runner):
+  """How that runner's results are stored in a model's data: the first runner of
+  a library reports itself in the keys of the model, the others under their name."""
+  runners = stats_by_libname[libname]["runners"]
+  return None if not runner or runner == runners[0] else runner
+
+stats_by_libname = {}
+skipped_libs = {}
+# A library that did not load cannot be told apart from one with no models left.
+failedToLoad = []
+tests=[]
+for (library,conf) in configs:
+  loadFailed = False
+  # Only when asked, so a normal run's confighash is unchanged
+  if args.nobuildmodel:
+    conf["noBuildModel"] = True
+  if args.coldhot:
+    conf["coldHot"] = True
+  c=conf.copy()
+  del(c["configFromFile"])
+  if "referenceFiles" in c:
+    del(c["referenceFilesURL"])
+    # Where the reference files happen to live on this machine must not go into
+    # the hash: their contents are hashed just below, and two machines sharing
+    # a database have to agree on what a configuration is. Each machine only
+    # ever had its own sqlite3 file before, so an absolute path was harmless.
+    c["referenceFiles"] = "referenceFiles"
+    confighash = strToHashInt(str(c)+hashReferenceFiles(conf["referenceFiles"]))
+  else:
+    confighash = strToHashInt(str(c)+hashReferenceFiles(""))
+  conf["confighash"] = confighash
+  conf["omhome"] = omhome
+  # if procOMC = 0 use max procs, use procOMC = 1 if not defined, else use the given value
+  if "procOMC" in conf:
+    if conf.get("procOMC") == 0:
+      omc_threads = ''
+    else:
+      omc_threads = '-n=%s' % conf.get("procOMC")
+  else:
+    omc_threads = '-n=1'
+
+  # if procCompile = 0 use max procs, use procCompile = 1 if not defined, else use the given value
+  if "procCCompile" in conf:
+    if conf.get("procCCompile") == 0:
+      conf["procCCompile"] = n_cores
+  else:
+    conf["procCCompile"] = 1
+  conf["omc_thread_cmd"] = omc_threads
+  conf["haveCppRuntime"] = haveCppRuntime
+  conf["ulimitMemory"] = conf.get("ulimitMemory") or ulimitMemory
+  if conf["simCodeTarget"]=="wasm-jit":
+    # The JIT reserves ~4 GB of address space per wasm memory on top of what omc
+    # itself maps, which does not fit in the default virtual memory limit
+    conf["ulimitMemory"] = max(conf["ulimitMemory"], 16*1024*1024)
+  if conf.get("fmi"):
+    conf["haveFMI"] = fmiOK_C
+    conf["haveFMICpp"] = fmiOK_Cpp
+    conf["fmisimulator"] = fmisimulator
+    conf["fmisimulators"] = ["%s=%s" % (n, c) for (n, c) in fmisimulators]
+    conf["fmuType"] = fmuType
+  if wasmfmurunners:
+    conf["wasmfmurunners"] = [n for (n, _) in wasmfmurunners]
+  if solvers:
+    conf["solvers"] = [n for (n, _) in solvers]
+  print("Loading %s" % library)
+  sys.stdout.flush()
+  if (not canChangeOptLevel) and "optlevel" in conf:
+    print("Deleting optlevel")
+    del conf["optlevel"]
+  if not (omc.sendExpression('setCommandLineOptions("-g=Modelica")') or omc.sendExpression('setCommandLineOptions("+g=Modelica")')):
+    print("Failed to set Modelica grammar")
+    sys.exit(1)
+  omc.sendExpression('clear()')
+  if "loadFileCommands" in conf:
+    for command in conf["loadFileCommands"]:
+      if not omc.sendExpression(command):
+        try:
+          print("Failed to run command %s: %s" % (command,omc.sendExpression('OpenModelica.Scripting.getErrorString()')))
+        except:
+          print("Failed to run command %s OpenModelica.Scripting.getErrorString() failed..." % command)
+        loadFailed = True
+    librariesToLoad = []
+  else:
+    librariesToLoad = [[library,conf["libraryVersion"]]] + conf.get("extraLibraries", [])
+  for (lib,version) in librariesToLoad:
+    if conf["libraryVersionLatestInPackageManager"]:
+      availableVersions = omc.sendExpression('getAvailablePackageVersions(%s,"%s")' % (lib,version))
+      if not availableVersions:
+        try:
+          print("Failed to getAvailablePackageVersions %s %s: %s" % (library,version,omc.sendExpression('OpenModelica.Scripting.getErrorString()')))
+        except:
+          print("Failed to getAvailablePackageVersions %s %s. OpenModelica.Scripting.getErrorString() failed..." % (library,conf["libraryVersion"]))
+      versions = "{" + ",".join(['"'+v+'"' for v in availableVersions]) + "}"
+    else:
+      versions = '{"%s"}' % version
+
+    exactMatch=''
+    if conf["libraryVersionExactMatch"]:
+      if conf["libraryVersionLatestInPackageManager"]:
+        raise Exception("Library %s has both libraryVersionLatestInPackageManager:true and libraryVersionExactMatch:true! Make up your mind." % libName)
+      exactMatch=', requireExactVersion=true'
+
+    if not omc.sendExpression('loadModel(%s,%s%s)' % (lib,versions,exactMatch)):
+      try:
+        print("Failed to load library %s %s: %s" % (library,versions,omc.sendExpression('OpenModelica.Scripting.getErrorString()')))
+      except:
+        print("Failed to load library %s %s. OpenModelica.Scripting.getErrorString() failed..." % (library,conf["libraryVersion"]))
+      loadFailed = True
+  if loadFailed:
+    failedToLoad.append(shared.libname(library, conf))
+    continue
+
+  # adrpo: do not sort the top level names as sometimes that loads a bad MSL version
+  # conf["loadFiles"] = sorted(omc.sendExpression("{getSourceFile(cl) for cl in getClassNames()}"))
+  conf["loadFiles"] = omc.sendExpression("{getSourceFile(cl) for cl in getClassNames()}")
+
+  if not (omc.sendExpression('setCommandLineOptions("-g=MetaModelica")') or omc.sendExpression('setCommandLineOptions("+g=Modelica")')):
+    print("Failed to set MetaModelica grammar")
+    sys.exit(1)
+
+  try:
+    conf["libraryLocation"]=omc.sendExpression('uriToFilename("modelica://%s/")' % library)
+    conf["resourceLocation"]=omc.sendExpression('uriToFilename("modelica://%s/Resources")' % library)
+  except:
+    conf["libraryLocation"]=""
+    conf["resourceLocation"]=""
+
+  if "runOnceBeforeTesting" in conf:
+    for cmd in conf["runOnceBeforeTesting"]:
+      # replace the resource location in the command if present
+      cmd = [c.replace("$resourceLocation", conf["resourceLocation"]) for c in cmd]
+      cmd = [c.replace("$libraryLocation", conf["libraryLocation"]) for c in cmd]
+      check_call_log(cmd, stderr=subprocess.STDOUT)
+
+  if "customCommands" in conf:
+    cmd = conf["customCommands"]
+    # replace the $libraryLocation in the customCommands if present
+    cmd = [c.replace("$libraryLocation", conf["libraryLocation"]) for c in cmd]
+    conf["customCommands"] = cmd
+  if "environmentSimulation" in conf:
+    cmd = conf["environmentSimulation"]
+    # replace the $libraryLocation in the environmentSimulation if present
+    cmd = [[el.replace("$libraryLocation", conf["libraryLocation"]) for el in c] for c in cmd]
+    # A value with a wildcard is a search path: every directory it matches.
+    cmd = [[name, os.pathsep.join(sorted(glob.glob(value))) if "*" in value else value] for (name, value) in cmd]
+    conf["environmentSimulation"] = cmd
+  if "environmentTranslation" in conf:
+    cmd = conf["environmentTranslation"]
+    # replace the $libraryLocation in the environmentTraslation if present
+    cmd = [[el.replace("$libraryLocation", conf["libraryLocation"]) for el in c] for c in cmd]
+    conf["environmentTranslation"] = cmd
+
+  conf["libraryVersionRevision"]=omc.sendExpression('getVersion(%s)' % library)
+  librarySourceFile=os.path.normpath(omc.sendExpression('getSourceFile(%s)' % library))
+  lastChange=(librarySourceFile[:-3]+".last_change") if not librarySourceFile.endswith("package.mo") else (os.path.dirname(librarySourceFile)+".last_change")
+  if os.path.exists(lastChange):
+    conf["libraryLastChange"] = " %s (revision %s)" % (conf["libraryVersionRevision"],"\n".join(open(lastChange).readlines()).strip())
+  else:
+    conf["libraryLastChange"] = "%s (%s)" % (conf["libraryVersionRevision"], librarySourceFile)
+  metadataFile = os.path.join(os.path.dirname(librarySourceFile), "openmodelica.metadata.json")
+  if os.path.exists(metadataFile):
+    with open(metadataFile) as metadataIn:
+      metadata = json.load(metadataIn)
+      conf["libraryLastChange"] = "%s (%s)" % (metadata["version"],metadata.get("sha") or metadata["zipfile"])
+      conf["metadata"] = json.dumps(metadata, indent=1)
+  else:
+    conf["metadata"] = ""
+  if not conf["libraryVersionRevision"]:
+    conf["libraryVersionRevision"] = conf["libraryLastChange"]
+  if conf.get("fmi") and fmisimulatorversion:
+    conf["libraryVersionRevision"] = conf["libraryVersionRevision"] + " " + fmisimulatorversion.decode("ascii")
+    conf["libraryLastChange"] = conf["libraryLastChange"] + " " + fmisimulatorversion.decode("ascii")
+  res=omc.sendExpression('{c for c guard isExperiment(c) and not regexBool(typeNameString(x), "^Modelica_Synchronous\\.WorkInProgress") in getClassNames(%s, recursive=true)}' % library)
+  if conf.get("ignoreModelPrefix"):
+    if isinstance(conf["ignoreModelPrefix"], list):
+      prefixes = conf["ignoreModelPrefix"]
+      for prefix in prefixes:
+        res=list(filter(lambda x: not x.startswith(prefix), res))
+    else: # in this part it should be only a string
+      prefix = conf["ignoreModelPrefix"]
+      res=list(filter(lambda x: not x.startswith(prefix), res))
+  libName=shared.libname(library, conf)
+  conf["heavyModels"].update(heavyModelsByLibrary.get(libName) or {})
+  conf["exclusiveModels"].update(exclusiveModelsByLibrary.get(libName) or {})
+  todo = runnersToRun(libName, conf)
+  if libName in stats_by_libname or libName in skipped_libs:
+    raise Exception("Duplicate libName found: %s" % libName)
+  if todo:
+    # On the shared database another machine may already be running this exact
+    # job; claiming it is what keeps the two from testing the same thing. The
+    # library is built for the first runner missing it, so that is the branch.
+    claimBranch = branchForRunner(todo[0]) if todo[0] else branch
+    if not db.claim(claimBranch, libName, conf["libraryLastChange"], omc_version, confighash):
+      (host, since) = db.claimedBy(claimBranch, libName, conf["libraryLastChange"], omc_version, confighash)
+      print("Skipping %s as %s has been testing it since %s" % (libName, host, since))
+      skipped_libs[libName] = None
+      continue
+    restrictRunners(conf, todo)
+    stats_by_libname[libName] = {"conf":conf, "stats":[], "runners":todo}
+    tests = tests + [(r,library,libName,libName+"_"+r,conf) for r in res]
+    print("Running library %s (%d tests)%s" % (libName, len(res),
+                                               (" with %s" % ", ".join(todo)) if todo[0] else ""))
+  else:
+    v = haveResultsFor(primaryBranch, libName, conf)
+    print("Skipping %s as we already have results for it: %s" % (libName,str(v)))
+    skipped_libs[libName] = v[0]
+
+try:
+  del omc
+except:
+  pass
+
+if failedToLoad:
+  db.release()
+  raise SystemExit("Failed to load: %s" % ", ".join(failedToLoad))
+
+# Do not keep the tables locked while testing; see createTables.
+db.commit()
+print("Checked which libraries to run")
+sys.stdout.flush()
+
+errorOccurred=False
+for (modelName,library,libName,name,conf) in tests:
+  # conf is shared by every test of the library, so these stay local.
+  ulimitExe = modelUlimitExe(conf, modelName)
+  simFlags = simulationFlags(conf, ulimitExe)
+  replacements = (
+    (u"#logFile#", "/tmp/OpenModelicaLibraryTesting.log"),
+    (u"#library#", library),
+    (u"#modelName#", modelName),
+    (u"#fileName#", name),
+    (u"#customCommands#", conf["customCommands"]),
+    (u"#modelVersion#", conf["libraryVersion"]),
+    (u"#ulimitOmc#", str(conf["ulimitOmc"])),
+    (u"#defaultTolerance#", str(conf["defaultTolerance"])),
+    (u"#defaultNumberOfIntervals#", str(conf["defaultNumberOfIntervals"])),
+    (u"#reference_reltol#", str(conf["reference_reltol"])),
+    (u"#reference_reltolDiffMinMax#", str(conf["reference_reltolDiffMinMax"])),
+    (u"#reference_rangeDelta#", str(conf["reference_rangeDelta"])),
+    (u"#simFlags#", simFlags),
+    (u"#referenceFiles#", str(conf.get("referenceFilesURL") or conf.get("referenceFiles") or "")),
+    (u"#referenceFileNameDelimiter#", conf["referenceFileNameDelimiter"]),
+    (u"#referenceFileExtension#", conf["referenceFileExtension"]),
+  )
+  with open(name + ".conf.json", 'w') as fp:
+    newconf = dict(conf.items())
+    if "referenceFiles" in newconf:
+      newconf["referenceFiles"] = newconf["referenceFiles"].replace("\\","/")
+    if "referenceFilesURL" in newconf:
+      newconf["referenceFilesURL"] = newconf["referenceFilesURL"].replace("\\","/")
+    if "libraryLocation" in newconf:
+      newconf["libraryLocation"] = newconf["libraryLocation"].replace("\\","/")
+    if "libraryLastChange" in newconf:
+      newconf["libraryLastChange"] = newconf["libraryLastChange"].replace("\\","/")
+    newconf["library"] = library
+    newconf["modelName"] = modelName
+    newconf["fileName"] = name
+    newconf["ulimitExe"] = ulimitExe
+    newconf["simFlags"] = simFlags
+    try:
+      newconf["referenceFile"] = getReferenceFileName(newconf).replace("\\","/")
+    except Exception as e:
+      # Find all such errors
+      print(e)
+      errorOccurred = True
+    json.dump(newconf, fp)
+if errorOccurred:
+  sys.exit(1)
+
+print("Created .conf.json files")
+sys.stdout.flush()
+
+def runScript(c, timeout, memoryLimit, runverbose):
+  j = os.path.normpath("files/%s.stat.json" % c)
+  try:
+    os.remove(j)
+  except:
+    pass
+  start=monotonic()
+  # runCommand("%s %s %s.mos" % (omc_exe, omc_threads, c), prefix=c, timeout=timeout)
+  if runverbose:
+    print("Starting test: %s" % c)
+    sys.stdout.flush()
+
+  if isWin:
+    res_cmd = runCommand("%s testmodel.py --win %s --msysEnvironment=%s --libraries=\"%s\" %s --ompython_omhome=%s %s.conf.json > files/%s.cmdout 2>&1" % (pythonExecutablePopenWin, '--addmsl' if addmsl else "", msysEnvironment, librariespath, ("--docker %s --dockerExtraArgs '%s'" % (docker, " ".join(dockerExtraArgs))) if docker else "", ompython_omhome, c, c), prefix=c, timeout=timeout)
+  else:
+    res_cmd = runCommand("ulimit -v %d; OMLT_JOB=%s ./testmodel.py %s --libraries=%s %s --ompython_omhome=%s %s.conf.json > files/%s.cmdout 2>&1" % (memoryLimit, c, '--addmsl' if addmsl else "", librariespath, ("--docker %s --dockerExtraArgs '%s'" % (docker, " ".join(dockerExtraArgs))) if docker else "", ompython_omhome, c, c), prefix=c, timeout=timeout)
+    killLeftovers(c)
+
+  if res_cmd != 0:
+    print("files/%s.err" % c)
+    with open(os.path.normpath("files/%s.err" % c), "a+") as errfile:
+      errfile.write("Failed to read output from testmodel.py, exit status != 0:\n")
+      try:
+        with open(os.path.normpath("files/%s.cmdout" % c)) as cmdout:
+          errfile.write(cmdout.read())
+      except IOError:
+        pass
+      except OSError:
+        pass
+
+  if clean:
+    try:
+      os.unlink(os.path.normpath("files/%s.cmdout" % c))
+    except OSError:
+      pass
+
+  execTime=monotonic()-start
+  assert(execTime >= 0.0)
+  try:
+    data=json.load(open(j))
+  except:
+    data = {"phase":0}
+  data["exectime"] = execTime
+  json.dump(data, open(j,"w"))
+  if runverbose:
+    print("[%s %ds] " % (c, execTime))
+    sys.stdout.flush()
+
+def expectedExec(c):
+  (model,lib,libName,name,data) = c
+  if "expectedExec" in data:
+    return data["expectedExec"]
+  cursor.execute("SELECT exectime FROM %s WHERE libname = ? AND model = ? AND finalphase >= 0 ORDER BY date DESC LIMIT 1" % db.quote(primaryBranch), (libName,model))
+  v = cursor.fetchone()
+  data["expectedExec"] = (v or (0.0,))[0]
+  return data["expectedExec"]
+
+start=monotonic()
+tests=sorted(tests, key=lambda c: expectedExec(c), reverse=True)
+db.commit()
+stop=monotonic()
+print("Querying expected execution time: %s" % friendlyStr(stop-start))
+sys.stdout.flush()
+
+# Cleanup old runs
+try:
+  if clean:
+    rmtree("./files")
+    print("Cleaned files directory")
+except OSError:
+  pass
+try:
+  os.mkdir("files")
+except OSError:
+  pass
+print("Created files directory")
+sys.stdout.flush()
+
+numberOfTests = len(tests)
+
+if numberOfTests==0 and not stats_by_libname:
+  print("Everything already up to date. Not executing any tests.")
+  sys.exit(0)
+
+
+print("Starting execution of %d tests. Estimated execution time %s (wrong if there are new or few tests).\n" % (numberOfTests, friendlyStr(sum(expectedExec(c) for c in tests)/(1.0*n_jobs))))
+sys.stdout.flush()
+start=monotonic()
+start_as_time=time.localtime()
+testRunStartTimeAsEpoch = int(time.time())
+
+def testTimeout(model, data):
+  """Need translateModel + make + exe... Each command that runs out of time keeps
+  running for a grace before it gives up; killing testmodel.py during it throws
+  away the phase times."""
+  if customTimeout > 0.0:
+    return customTimeout
+  return 2*(data["ulimitOmc"]+alarmGrace(data["ulimitOmc"]))+modelUlimitExe(data, model)+alarmGrace(modelUlimitExe(data, model))+25
+
+def progress(done, total):
+  if runverbose or n_jobs == 1 or done % 100 == 0:
+    print("[%d/%d done, %s]" % (done, total, friendlyStr(monotonic()-start)))
+    sys.stdout.flush()
+
+# The wasm-jit runtime module and the external "C" side libraries are fixed and
+# model-independent, but compiling them costs gigabytes of Cranelift each. Fill
+# the per-user cache once here rather than in every one of thousands of omc
+# processes, and outside runScript, whose ulimit -v the compile does not fit in.
+if any(data.get("simCodeTarget") == "wasm-jit" for (_, _, _, _, data) in tests):
+  print("Precompiling the wasm-jit artifacts")
+  sys.stdout.flush()
+  try:
+    out = check_output_log(omc_cmd, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                           timeout=900, env=dict(os.environ, OMC_WASM_PRECOMPILE_CACHE=""))
+    print(out.decode(errors="replace").strip())
+  except Exception as e:
+    print("Warning: could not precompile them, so every model compiles them itself: %s" % e)
+  sys.stdout.flush()
+
+def jobClass(test):
+  if isExclusiveModel(test[4], test[0]):
+    return "exclusive"
+  if isHeavyModel(test[4], test[0]):
+    return "heavy"
+  return None
+
+services = testservices.start()
+shared.runCapped(tests,
+                 jobClass,
+                 lambda test: runScript(test[3], testTimeout(test[0], test[4]), test[4]["ulimitMemory"], runverbose),
+                 n_jobs, {"heavy": heavyJobs, "exclusive": 1}, progress)
+testservices.stop(services)
+stop=monotonic()
+print("Execution time: %s" % friendlyStr(stop-start))
+if leakedJobs:
+  print("%d tests left processes running, see their .err files: %s" % (len(leakedJobs), " ".join(leakedJobs[:20])))
+assert(stop-start >= 0.0)
+
+#if max(cmd_res) > 0:
+#  raise Exception("A command failed with exit status")
+
+def loadJsonOrEmptySet(f):
+  if os.stat(f).st_size == 0:
+    return {}
+  else:
+    return json.load(open(f))
+
+stats=dict([(name,(name,model,libname,loadJsonOrEmptySet("files/%s.stat.json" % name))) for (model,lib,libname,name,conf) in tests])
+#for k in sorted(stats.keys(), key=lambda c: stats[c][3]["exectime"], reverse=True):
+#  print("%s: exectime %.2f" % (k, stats[k][3]["exectime"]))
+
+if args.coldhot:
+  # Only "sim" (the hot run) is stored; the cold one is reported here
+  print("Cold vs hot simulation time:")
+  for key in sorted(stats.keys(), key=lambda k: stats[k][1]):
+    (name,model,libname,data)=stats[key]
+    if data.get("simcold") is not None:
+      print("  %-70s cold %8.4f  hot %8.4f" % (model, data["simcold"], data.get("sim") or 0.0))
+  sys.stdout.flush()
+
+BUILD_PHASE = 5
+"""The last phase a model shares with every simulator of its FMU."""
+
+def phaseWithoutSimulator(data):
+  """How far a model got for a simulator that never ran it.
+
+  Everything up to the build is shared, so such a model reports the phase the
+  build reached and never the phase another simulator went on to reach with the
+  same FMU. Reporting that one would claim a simulation, and a verification,
+  that this simulator never performed.
+  """
+  return min(data.get("phase") or 0, BUILD_PHASE)
+
+def simulatedTime(simulated):
+  """The wall clock simulating and verifying once cost.
+
+  An older result file has no simwall and only says what the tool spent.
+  """
+  sim = simulated.get("simwall")
+  if sim is None:
+    sim = simulated.get("sim") or 0.0
+  return sim + ((simulated.get("diff") or {}).get("time") or 0.0)
+
+def runnerExecTime(data, simulated):
+  """The wall clock one runner of an FMU or of an artifact cost.
+
+  exectime is the whole run of the model, and all but the simulations is shared
+  by its runners, so each reports the shared part plus only its own simulation.
+  """
+  runners = [data] + list((data.get("simulators") or {}).values())
+  shared_time = (data.get("exectime") or 0.0) - sum(simulatedTime(r) for r in runners)
+  return max(0.0, shared_time) + simulatedTime(simulated)
+
+def resultValues(model, libname, data, simulator=None):
+  """One row of a branch table.
+
+  Everything up to the build is what the model cost whatever simulates it, so
+  the simulators of one FMU share it and differ only in the simulation, the
+  verification and how far they got.
+  """
+  simulated = data if simulator is None else (data.get("simulators") or {}).get(simulator)
+  if simulated is None:
+    simulated = {"phase": phaseWithoutSimulator(data)}
+  diff = simulated.get("diff") or {}
+  return (testRunStartTimeAsEpoch,
+    libname,
+    model,
+    runnerExecTime(data, simulated),
+    data.get("frontend") or 0.0,
+    data.get("backend") or 0.0,
+    data.get("simcode") or 0.0,
+    data.get("templates") or 0.0,
+    data.get("build") or 0.0,
+    simulated.get("sim") or 0.0,
+    diff.get("time") or 0.0,
+    len(diff.get("vars") or []),
+    diff.get("numCompared") or 0,
+    simulated.get("phase") or 0,
+    data.get("parsing") or 0.0,
+    data.get("maxrss") or 0
+  )
+
+def removedModels(resultBranch, libname, tested):
+  """The models the previous run of that library had and this one no longer finds.
+
+  Once written, the removals are that library's newest rows, so a library that
+  stays empty is marked once rather than at every run.
+  """
+  previous = cursor.execute("""SELECT model FROM %s WHERE libname=? AND finalphase>=0
+      AND date=(SELECT MAX(date) FROM %s WHERE libname=? AND date<?)"""
+      % (db.quote(resultBranch), db.quote(resultBranch)),
+      (libname, libname, testRunStartTimeAsEpoch)).fetchall()
+  return sorted(set(model for (model,) in previous) - tested)
+
+def removedValues(model, libname):
+  """One row of a branch table saying the library no longer has that model."""
+  return (testRunStartTimeAsEpoch, libname, model,
+          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, shared.DELETED_PHASE, 0.0, 0)
+
+resultPlaceholders = ",".join("?" * len(resultsdb.BRANCH_COLUMNS))
+
+def cpu_name():
+  if isWin:
+    return processor()
+  else:
+    for line in open("/proc/cpuinfo").readlines():
+      if "model name" in line.strip():
+        return (re.sub( ".*model name.*:", "", line, count=1)).strip()
+
+if isWin:
+  lsb_release = ""
+else:
+  try:
+    lsb_release = check_output_log(commands + ["cat","/etc/lsb-release"]).decode().strip()
+    lsb_release = dict(a.split("=") for a in lsb_release.split("\n"))["DISTRIB_DESCRIPTION"].strip('"')
+  except:
+    lsb_release = ""
+
+hostname = resultsdb.hostname()
+sysInfo = "%s: %s, %d GB RAM, %s%s" % (hostname, cpu_name(), int(math.ceil(psutil.virtual_memory().total / (1024.0**3))), ("Docker " + docker + " ") if docker else "", lsb_release)
+
+testedModels = dict((libname, set()) for libname in stats_by_libname)
+for (name,model,libname,data) in stats.values():
+  testedModels[libname].add(model)
+
+for key in stats.keys():
+  (name,model,libname,data)=stats[key]
+  stats_by_libname[libname]["stats"].append(stats[key])
+
+# A branch is filled by the libraries the run owed it; the others kept the
+# results they had, and nothing of them is written or published again.
+for (resultBranch, runner) in resultBranches:
+  libnames = [l for l in stats_by_libname.keys() if ranRunner(l, runner)]
+  if not libnames:
+    continue
+  db.createTables(resultBranch)
+  rows = 0
+  for key in stats.keys():
+    (name,model,libname,data)=stats[key]
+    if not ranRunner(libname, runner):
+      continue
+    cursor.execute("INSERT INTO %s VALUES (%s)%s" % (db.quote(resultBranch), resultPlaceholders, db.insertIgnore()),
+                   resultValues(model, libname, data, simulatorKey(libname, runner)))
+    rows += 1
+  for libname in libnames:
+    for model in removedModels(resultBranch, libname, testedModels[libname]):
+      cursor.execute("INSERT INTO %s VALUES (%s)%s"
+                     % (db.quote(resultBranch), resultPlaceholders, db.insertIgnore()),
+                     removedValues(model, libname))
+      rows += 1
+    confighash = stats_by_libname[libname]["conf"]["confighash"]
+    cursor.execute("INSERT INTO libversion VALUES (?,?,?,?,?,?,?)%s" % db.insertIgnore(), (testRunStartTimeAsEpoch, resultBranch, libname, stats_by_libname[libname]["conf"]["libraryLastChange"], confighash, hostname, sysInfo))
+  # An omcversion row without results is what clean-empty-omcversion-dates.py
+  # has to scan the database for.
+  if rows:
+    cursor.execute("INSERT INTO omcversion VALUES (?,?,?)%s" % db.insertIgnore(), (testRunStartTimeAsEpoch, resultBranch, omc_version))
+
+db.commit()
+db.release()
+
+"""
+# Not really a good thing to do; was just done to make generation of the report simpler
+for libname in skipped_libs.keys():
+  values = (testRunStartTimeAsEpoch, skipped_libs[libname], libname)
+  cursor.execute("UPDATE [libversion] SET date = ? WHERE date = ? AND libname = ? AND branch = ? AND confighash = ?", (testRunStartTimeAsEpoch, skipped_libs[libname], libname, branch, confighash))
+  cursor.execute("UPDATE [%s] SET date = ? WHERE date = ? AND libname = ?" % branch, values)
+"""
+
+def checkNumSucceeded(numSucceeded, n):
+  if numSucceeded[n]==numSucceeded[n-1]:
+    return "#00FF00"
+  else:
+    return "#FFCC66"
+
+def drLink(filename_prefix, data):
+  """The (dr) link to the report a data reconciliation run wrote, if it wrote one."""
+  if not (data.get("dr") or {}).get("report"):
+    return ""
+  return ' (<a href="%s.dr/%s.html">dr</a>)' % (filename_prefix, os.path.basename(filename_prefix))
+
+def drCell(conf, data):
+  """The Data reconciliation cell of a model, for the libraries tested with it."""
+  if not conf.get("dataReconciliation"):
+    return ""
+  dr = data.get("dr") or {}
+  if dr.get("reconciled"):
+    return '<td bgcolor="#00FF00">reconciled</td>'
+  if dr.get("report"):
+    return '<td bgcolor="#FFCC66">failed</td>'
+  return '<td bgcolor="#FFCC66">&nbsp;</td>'
+
+def drSummary(conf, stats):
+  """The header cell and the count of reconciled models for the library summary."""
+  if not conf.get("dataReconciliation"):
+    return ("", "", "")
+  n = sum(1 for s in stats if (s[3].get("dr") or {}).get("reconciled"))
+  return ("<th>Data reconciliation</th>", '<td bgcolor="%s">%d</td>' % ("#00FF00" if n == len(stats) else "#FFCC66", n),
+          "<th>Data reconciliation</th>")
+
+def checkPhase(phase, n):
+  if phase >= n:
+    return "#00FF00"
+  else:
+    return "#FFCC66"
+
+def is_non_zero_file(fpath):
+    return os.path.isfile(os.path.normpath(fpath)) and os.path.getsize(os.path.normpath(fpath)) > 0
+
+# create target dir to move results without sync operations (win or when --noSync is used)
+def stageRootFor(simulator, suffix):
+  """The directory a branch is published from.
+
+  The first simulator publishes the workspace itself, as a job always has. The
+  others write <model>_<simulator>.sim there so as not to overwrite it, and are
+  published from a directory of their own where the same files appear under the
+  plain <model>.sim a branch directory has always held.
+  """
+  if not suffix:
+    return "."
+  root = "publish_%s" % simulator
+  for d in (root, os.path.join(root, "files")):
+    try:
+      os.mkdir(d)
+    except OSError:
+      pass
+  return root
+
+def stagePublished(stageRoot, workspaceFiles, workspacePrefix, publishedPrefix, suffix):
+  """Link one model's results into the directory its branch is published from.
+
+  workspaceFiles is the sorted listing of files/: a glob per model would read
+  the whole directory again for every model.
+  """
+  if not suffix:
+    return
+  i = bisect.bisect_left(workspaceFiles, workspacePrefix)
+  while i < len(workspaceFiles) and workspaceFiles[i].startswith(workspacePrefix):
+    f = workspaceFiles[i]
+    i += 1
+    published = os.path.join(stageRoot, publishedPrefix + f[len(workspacePrefix):])
+    try:
+      if os.path.exists(published):
+        os.unlink(published)
+      os.link(f, published)
+    except OSError:
+      shutil.copy2(f, published)
+
+def stageShared(stageRoot, prefix, suffix):
+  """The .err of the build belongs to every simulator of the model."""
+  if not suffix:
+    return
+  for f in glob.glob(glob.escape(prefix) + ".err"):
+    published = os.path.join(stageRoot, f)
+    try:
+      if os.path.exists(published):
+        os.unlink(published)
+      os.link(f, published)
+    except OSError:
+      shutil.copy2(f, published)
+
+def dataForSimulator(data, simulator):
+  """The results of one model as one simulator saw them.
+
+  Everything up to the build is shared, so only the simulation, the comparison
+  against the reference file and the phase come from the simulator itself.
+  """
+  if simulator is None:
+    return data
+  simulated = (data.get("simulators") or {}).get(simulator)
+  merged = dict(data)
+  merged["sim"] = (simulated or {}).get("sim")
+  merged["diff"] = (simulated or {}).get("diff")
+  # A model that never got as far as being simulated stopped in the build,
+  # which every simulator of it shares.
+  merged["phase"] = simulated.get("phase") if simulated is not None else phaseWithoutSimulator(data)
+  return merged
+
+def artifactSuffix(simulator):
+  """What tells the files of one runner from those of another; the first runner
+  publishes the workspace itself, so only the others have one."""
+  return "_%s" % simulator if simulator else ""
+
+try:
+  githuburltesting = "https://github.com/OpenModelica/OpenModelicaLibraryTesting/commit/"
+  gitloglibrarytesting = check_output_log(["git", "log", '--pretty=<table><tr><th>Commit</th><th>Date</th><th>Author</th><th>Summary</th></tr><tr><td><a href="%s/%%h">%%h</a></td><td>%%ai</td><td>%%an</td><td>%%s</td></tr></table>' % (githuburltesting), "-1"], cwd="./").decode("utf-8")
+except subprocess.CalledProcessError as e:
+  print(str(e))
+  gitloglibrarytesting = "<table><tr><td>could not get the git log for OpenModelicaLibraryTesting</td></tr></table>"
+
+def readReferenceFilesVersion(c):
+  # adrpo: attempt to get the revision of the reference files if possible
+  if DEBUG:
+    print("referenceFiles git ... attempting to retrieve info from directory: %s" % c)
+    sys.stdout.flush()
+  gitReferenceFiles = c
+  # see if we have a commit file
+  f = os.path.join(c, "commit")
+  if os.path.exists(f):
+    with open(f) as fin:
+      print("referenceFiles git ... read from file %s" % f)
+      sys.stdout.flush()
+      return fin.read()
+  try:
+    if isinstance(c, (str, bytes)):
+      if DEBUG:
+        print("referenceFiles git ... see if directory has an evironment variable")
+        sys.stdout.flush()
+      m = re.search("^[$][A-Z_]+", c)
+      if m:
+        k = m.group(0)[1:]
+        if k not in os.environ:
+          if DEBUG:
+            print("referenceFiles git ... environment variable used in the directory cannot be found in the environment: %s" % k)
+            sys.stdout.flush()
+          raise Exception("Environment variable %s not defined, but used in JSON config for reference files" % k)
+        gitReferenceFiles = c.replace(m.group(0), os.environ[k])
+        if DEBUG:
+          print("referenceFiles git ... directory after replacing the environment variable: %s" % gitReferenceFiles)
+          sys.stdout.flush()
+      sys.stdout.flush()
+    try:
+      gitReferenceFilesURL = check_output_log(["git", "config", "--get", "remote.origin.url"], cwd=gitReferenceFiles).decode("utf-8")
+    except subprocess.CalledProcessError as e:
+      print(e)
+      gitReferenceFilesURL = gitReferenceFiles
+    gitReferenceFilesVersion = check_output_log(["git", "log", '--pretty=<table><tr><th>Commit</th><th>Date</th><th>Author</th><th>Summary</th></tr><tr><td><a href="%s/%%h">%%h</a></td><td>%%ai</td><td>%%an</td><td>%%s</td></tr></table>' % (gitReferenceFilesURL), "-1"], cwd=gitReferenceFiles).decode("utf-8")
+    print("referenceFiles git ... got version information: %s" % gitReferenceFilesVersion)
+    sys.stdout.flush()
+    return gitReferenceFilesVersion
+  except subprocess.CalledProcessError as e:
+    print("referenceFiles git ... something went wrong with getting the git info for directory: %s" % c)
+    print(str(e))
+    sys.stdout.flush()
+    return ""
+
+referenceFilesVersions = {}
+
+def referenceFilesVersion(c):
+  """The git log of a directory of reference files.
+
+  Nearly every library shares the directory with another, and the git log of it
+  is the same for all of them, so it is asked for once per directory instead of
+  once per library.
+  """
+  if not c:
+    return ""
+  if c not in referenceFilesVersions:
+    referenceFilesVersions[c] = readReferenceFilesVersion(c)
+  return referenceFilesVersions[c]
+
+# Publishing one library is rsync waiting for the far side to enumerate a
+# directory of tens of thousands of files, so the libraries are published a few
+# at a time. Not many more: each one is an ssh connection of its own.
+PUBLISH_JOBS = 4
+
+# Every runner publishes its own results - .sim and diff files included - to the
+# directory of its own branch; the .err of the build is shared, so each of them
+# gets a copy of it.
+publishFailures = []
+for (resultBranch, runner) in resultBranches:
+  syncTimes = {}
+  result_location = outputFor(resultBranch)
+  if result_location != "" and (isWin or noSync):
+    # Unlike the rsync path, this one is given the directory the branches live
+    # in and appends the branch itself.
+    resRootPath = os.path.join(jobOutput, resultBranch)
+    if os.path.exists(resRootPath):
+      rmtree(resRootPath)
+    os.makedirs(resRootPath)
+
+  def makeRemoteDirs(libnames):
+    """Create the branch directory and every library's files/ in one connection."""
+    byStage = {}
+    for libname in libnames:
+      simulator = simulatorKey(libname, runner)
+      stageRoot = stageRootFor(simulator, artifactSuffix(simulator))
+      os.makedirs(os.path.join(stageRoot, "emptydir", libname, "files"), exist_ok=True)
+      byStage.setdefault(stageRoot, []).append(libname)
+    for (stageRoot, libs) in byStage.items():
+      # The /./ tells rsync -R where the relative part starts.
+      check_output_log(["rsync", "-aR", "--mkpath"]
+                       + ["emptydir/./%s/files" % l for l in libs]
+                       + [result_location], cwd=stageRoot)
+
+  htmltpl=open("library.html.tpl").read()
+  def publishLibrary(libname):
+    if libname in skipped_libs or not ranRunner(libname, runner):
+      return
+    s = None # Make sure I don't use this
+    simulator = simulatorKey(libname, runner)
+    suffix = artifactSuffix(simulator)
+    stageRoot = stageRootFor(simulator, suffix)
+    publishStartLib = monotonic()
+    filesList = open(os.path.join(stageRoot, libname + ".files"), "w")
+    filesList.write("/\n")
+    filesList.write("/%s.html\n" % libname)
+    filesList.write("/files/\n")
+    conf = stats_by_libname[libname]["conf"]
+    stats = [(n, m, l, dataForSimulator(d, simulator)) for (n, m, l, d) in stats_by_libname[libname]["stats"]]
+    for s in stats:
+      # What the simulator wrote in the workspace, and what it is published as:
+      # the branch of a simulator holds its results under the plain name.
+      workspace_prefix = "files/%s_%s%s" % (s[2],s[1],suffix)
+      filename_prefix = "files/%s_%s" % (s[2],s[1])
+      stagePublished(stageRoot, workspaceFiles, workspace_prefix, filename_prefix, suffix)
+      stageShared(stageRoot, "files/%s_%s" % (s[2],s[1]), suffix)
+      if is_non_zero_file(workspace_prefix+".sim"):
+        filesList.write("/%s.sim\n" % filename_prefix)
+      errPrefix = "files/%s_%s" % (s[2],s[1])
+      if is_non_zero_file(errPrefix+".err"):
+        filesList.write("/%s.err\n" % errPrefix)
+      if (s[3].get("dr") or {}).get("report"):
+        # The report of a data reconciliation run and the pages it links.
+        filesList.write("/%s.dr/***\n" % filename_prefix)
+      if (s[3].get("diff") or {}).get("vars"):
+        filesList.write("/%s.diff.mat\n" % filename_prefix)
+        filesList.write("/%s.diff.ref.mat\n" % filename_prefix)
+    filesList.close()
+    testsHTML = "\n".join(['<tr><td>%s%s%s</td><td bgcolor="%s">%s</td><td bgcolor="%s">%s</td>%s<td bgcolor="%s">%s</td><td>%s</td><td bgcolor="%s">%s</td><td bgcolor="%s">%s</td><td bgcolor="%s">%s</td><td bgcolor="%s">%s</td><td bgcolor="%s">%s</td><td>%s</td></tr>\n' %
+      (lambda filename_prefix, errPrefix, diff:
+        (
+        ('<a href="%s">%s</a>' % (errPrefix + ".err", html.escape(s[1]))) if is_non_zero_file(errPrefix + ".err") else html.escape(s[1]),
+        (' (<a href="%s">sim</a>)' % (filename_prefix + ".sim")) if is_non_zero_file(filename_prefix + suffix + ".sim") else "",
+        drLink(filename_prefix, s[3]),
+        checkPhase(s[3]["phase"], 7) if s[3]["phase"]>=6 else "#FFFFFF",
+        # Nothing was compared, whatever phase the model reports.
+        "&nbsp;" if diff is None else
+        (("%s (%d verified)" % (timeSeconds(diff.get("time")), diff.get("numCompared"))) if s[3]["phase"]>=7 else
+        ('%s (<a href="%s.diff.mat" data-omplot="%s.diff">%d/%d failed</a>)' % (timeSeconds(diff.get("time")), filename_prefix, filename_prefix, len(diff.get("vars")), diff.get("numCompared")))),
+        checkPhase(s[3]["phase"], 6),
+        timeSeconds(s[3].get("sim") or 0),
+        drCell(conf, s[3]),
+        checkPhase(s[3]["phase"], 5),
+        timeSeconds(sum(s[3].get(x) or 0.0 for x in ["frontend","backend","simcode","templates","build"])),
+        timeSeconds(s[3].get("parsing") or 0),
+        checkPhase(s[3]["phase"], 1),
+        timeSeconds(s[3].get("frontend") or 0),
+        checkPhase(s[3]["phase"], 2),
+        timeSeconds(s[3].get("backend") or 0),
+        checkPhase(s[3]["phase"], 3),
+        timeSeconds(s[3].get("simcode") or 0),
+        checkPhase(s[3]["phase"], 4),
+        timeSeconds(s[3].get("templates") or 0),
+        checkPhase(s[3]["phase"], 5),
+        timeSeconds(s[3].get("build") or 0),
+        timeSeconds(s[3].get("exectime") or 0)
+      ))(filename_prefix="files/%s_%s" % (s[2], s[1]), errPrefix="files/%s_%s" % (s[2], s[1]), diff=s[3].get("diff"))
+      for s in natsorted(stats, key=lambda s: s[1])])
+    numSucceeded = [len(stats)] + [sum(1 if s[3]["phase"]>=i else 0 for s in stats) for i in range(1,8)]
+
+    gitReferenceFilesVersion = referenceFilesVersion(conf.get("referenceFiles"))
+
+    (drSummaryHeader, drSummaryCell, drHeader) = drSummary(conf, stats)
+    replacements = (
+      (u"#drSummaryHeader#", drSummaryHeader),
+      (u"#drSummary#", drSummaryCell),
+      (u"#drHeader#", drHeader),
+      (u"#simulationLabel#", "Simulation (DR model)" if conf.get("dataReconciliation") else "Simulation"),
+      (u"#simulateLabel#", "Simulation (DR model)" if conf.get("dataReconciliation") else "Simulate"),
+      (u"#sysInfo#", html.escape(sysInfo)),
+      (u"#omcVersion#", html.escape(omc_version)),
+      (u"#fmiToolVersion#", ("<p>"+html.escape("FMI tool: %s" % fmisimulatorversion)+"</p>") if fmisimulatorversion else ""),
+      (u"#fmi#", ("<p>"+html.escape("FMI version: %s" % conf.get("fmi"))+"</p>") if conf.get("fmi") else ""),
+      (u"#optlevel#", html.escape(conf.get("optlevel")) if (canChangeOptLevel and conf.get("optlevel")) else "Tool default"),
+      (u"#timeStart#", html.escape(time.strftime('%Y-%m-%d %H:%M:%S', start_as_time))),
+      (u"#fileName#", html.escape(libname)),
+      (u"#customCommands#", html.escape("\n".join(conf["customCommands"]))),
+      (u"#libraryVersionRevision#", html.escape(conf["libraryVersionRevision"])),
+      (u"#OpenModelicaLibraryTesting#", gitloglibrarytesting),
+      (u"#metadata#", html.escape(conf["metadata"])),
+      (u"#ulimitOmc#", html.escape(str(conf["ulimitOmc"]))),
+      (u"#ulimitExe#", html.escape(str(conf["ulimitExe"]))),
+      (u"#ulimitExeModels#", "".join("Simulation time limit for %s: %ds<br>\n" % (html.escape(m), t)
+                                     for (m,t) in sorted(conf["ulimitExeModels"].items()))),
+      (u"#defaultTolerance#", html.escape(str(conf["defaultTolerance"]))),
+      (u"#defaultNumberOfIntervals#", html.escape(str(conf["defaultNumberOfIntervals"]))),
+      (u"#simFlags#", html.escape(conf.get("simFlags") or "")),
+      (u"#referenceFiles#", ('<p>Reference Files: %s</p>%s' % ((conf["referenceFilesURL"].replace(os.path.dirname(os.path.realpath(__file__)),"")), gitReferenceFilesVersion)) if ((conf.get("referenceFilesURL") or "") != "") else ""),
+      (u"#referenceTool#", ('<p>Verified using: %s (diffSimulationResults)</p>' % html.escape(ompython_omc_version)) if ((conf.get("referenceFiles") or "") != "") else ""),
+      (u"#Total#", html.escape(str(numSucceeded[0]))),
+      (u"#FrontendColor#", checkNumSucceeded(numSucceeded, 1)),
+      (u"#BackendColor#", checkNumSucceeded(numSucceeded, 2)),
+      (u"#SimCodeColor#", checkNumSucceeded(numSucceeded, 3)),
+      (u"#TemplatesColor#", checkNumSucceeded(numSucceeded, 4)),
+      (u"#CompilationColor#", checkNumSucceeded(numSucceeded, 5)),
+      (u"#SimulationColor#", checkNumSucceeded(numSucceeded, 6)),
+      (u"#VerificationColor#", checkNumSucceeded(numSucceeded, 7)),
+      (u"#Frontend#", html.escape(str(numSucceeded[1]))),
+      (u"#Backend#", html.escape(str(numSucceeded[2]))),
+      (u"#SimCode#", html.escape(str(numSucceeded[3]))),
+      (u"#Templates#", html.escape(str(numSucceeded[4]))),
+      (u"#Compilation#", html.escape(str(numSucceeded[5]))),
+      (u"#Simulation#", html.escape(str(numSucceeded[6]))),
+      (u"#Verification#", html.escape(str(numSucceeded[7]))),
+      (u"#totalTime#", html.escape(str(datetime.timedelta(seconds=int(sum(s[3].get("exectime") or 0.0 for s in stats)))))),
+      (u"#config#", html.escape(json.dumps(conf["configFromFile"], indent=1, sort_keys=True))),
+      (u"#testsHTML#", testsHTML),
+      (u"#omplot#", json.dumps(args.omplot))
+    )
+    open(os.path.join(stageRoot, "%s.html" % libname), "w").write(multiple_replace(htmltpl, *replacements))
+
+    # move results by sync operations (not available under win)
+    if result_location != "" and not isWin and not noSync:
+      result_location_libname = "%s/%s" % (result_location, libname)
+      try:
+        check_output_log(["rsync", "-aR", "--delete-excluded", "--include-from=%s.files" % libname, "--exclude=*", "./", result_location_libname], cwd=stageRoot)
+      except:
+        makeRemoteDirs([libname])
+        check_output_log(["rsync", "-aR", "--delete-excluded", "--include-from=%s.files" % libname, "--exclude=*", "./", result_location_libname], cwd=stageRoot)
+      if (conf.get("referenceFiles") or "") != "" and dygraphs:
+        check_output_log(["rsync", "-a", dygraphs, result_location_libname+"/files"])
+      syncTimes[libname] = monotonic() - publishStartLib
+    else:
+      print("No Sync: result_location [%s] != "" and not isWin [%s] and not noSync [%s] : library: %s" % (result_location, isWin, noSync, libname))
+
+    # move results without sync operations (win or when --noSync is used)
+    if result_location != "" and (isWin or noSync):
+      print("--> copy res file of library: " + libname)
+      libPath = os.path.join(resRootPath, libname)
+      if not os.path.exists(libPath):
+        os.makedirs(libPath)
+      libFilesPath = os.path.join(libPath, 'files')
+      if os.path.exists(libFilesPath):
+        rmtree(libFilesPath)
+      os.makedirs(libFilesPath)
+      try:
+        if clean:
+          shutil.move("./" + libname + ".html", libPath)
+        else:
+          shutil.copy2("./" + libname + ".html", libPath)
+      except:
+        print("-- problem durin copy/move of html file of lib: " + libname)
+
+      for file in glob.glob("./files/" + libname + '*.err') \
+                + glob.glob("./files/" + libname + '*.sim') \
+                + glob.glob("./files/" + libname + '*.csv') \
+                + glob.glob("./files/" + libname + '*.json') \
+                + glob.glob("./files/" + libname + '*.html'):
+        try:
+          print("copy: " + file)
+          shutil.copy2(file, libFilesPath)
+        except:
+          print("-- problem during file copy... maybe the file is still hooked by a process... :" + file)
+          pass
+
+  publishable = [l for l in stats_by_libname.keys() if l not in skipped_libs and ranRunner(l, runner)]
+  publishStart = monotonic()
+  workspaceFiles = sorted("files/" + f for f in os.listdir("files"))
+  if result_location != "" and not isWin and not noSync:
+    makeRemoteDirs(publishable)
+
+  def publishLibraryReportingFailure(libname):
+    try:
+      publishLibrary(libname)
+    except Exception:
+      print("Failed to publish %s of %s:" % (libname, resultBranch))
+      traceback.print_exc()
+      sys.stdout.flush()
+      return "%s/%s" % (resultBranch, libname)
+
+  publishFailures += [f for f in Parallel(n_jobs=PUBLISH_JOBS, backend="threading")
+                      (delayed(publishLibraryReportingFailure)(libname) for libname in publishable) if f]
+  print("Publishing %d libraries of %s: %s" % (len(publishable), resultBranch, friendlyStr(monotonic()-publishStart)))
+  for (libname, t) in sorted(syncTimes.items(), key=lambda x: -x[1])[:5]:
+    print("  %s: %s" % (libname, friendlyStr(t)))
+  sys.stdout.flush()
+
+if clean:
+  for g in ["*.o","*.so","*.h","*.c","*.cpp","*.simsuccess","*.conf.json","*.tmpfiles","*.log","*.libs","OMCpp*","*.fmu*","temp_*", "*.exe", "HelloWorld.bat", "*.makefile", "*.mat","*.xml", "*.bin", "*.json"]:
+    for f in glob.glob(g):
+      try:
+        if os.path.isdir(f):
+          rmtree(f)
+        elif os.path.exists(f):
+          os.unlink(f)
+      except:
+        print("-- problem during clean of: " + f)
+        pass
+
+if clean and (result_location == "" or (not isWin and not noSync)):
+  try:
+    rmtree("files/")
+  except:
+    print("-- problem during removing of ./files dir")
+
+db.close()
+
+if publishFailures:
+  print("Failed to publish: %s" % ", ".join(publishFailures))
+  sys.exit(1)
+
+print("all tests done ...")

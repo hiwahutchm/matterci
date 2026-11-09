@@ -1,0 +1,20 @@
+[
+  {
+    "library":"FCSys"
+  },
+  {
+    "library":"IdealizedContact"
+  },
+  {
+    "library":"Modelica_LinearSystems2",
+    "libraryVersionNameForTests":"",
+    "libraryVersion":"master"
+  },
+  {
+    "library":"Modelica_LinearSystems2",
+    "libraryVersion":"dev"
+  },
+  {
+    "library":"Modelica_StateGraph2"
+  }
+]

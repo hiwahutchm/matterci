@@ -1,0 +1,19 @@
+[
+  {
+    "library":"Annex60",
+    "libraryVersion":"1.0.0"
+  },
+  {
+    "library":"iPSL"
+  },
+  {
+    "library":"ObjectStab"
+  },
+  {
+    "library":"SiemensPower"
+  },
+  {
+    "library":"SiemensPower",
+    "libraryVersion":"OMCtest"
+  }
+]

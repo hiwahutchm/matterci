@@ -1,0 +1,99 @@
+{
+  "_comment": [
+    "The FMI simulators the testing knows how to run. Adding one is an entry here and nothing else.",
+    "",
+    "arguments         the command line, a template over: simulator, fmu, result, tempDir,",
+    "                  startTime, stopTime, tolerance, timeout, stepSize, outputVariables (the",
+    "                  variables of the reference, quoted for the shell), and every name",
+    "                  defined in optionalArguments.",
+    "optionalArguments flags that have to disappear when there is nothing to put in them, as a",
+    "                  result is always the file the tool should write; requestedResult is empty",
+    "                  when the run wants no result file at all, which only OMSimulator acts on.",
+    "                  name and its own template. OMSimulator crashes on --stepSize=0 instead of",
+    "                  ignoring it, so its step size flag lives here; FMPy wants --output-interval 0",
+    "                  all the same and writes the value straight into arguments.",
+    "command           how the tool is invoked, {simulator} by default; FMPy needs a subcommand.",
+    "resultExtension   what the tool writes, so the verification knows what to compare.",
+    "versionArgument   the flag that prints the version, recorded with the results.",
+    "branchSuffix      appended to --branch to get the table of this simulator; the default is",
+    "                  -<name>.",
+    "interface         me or cs: which interface the tool runs of an FMU built with --fmuType=me_cs,",
+    "                  available to the templates as {interface}. It is empty for an FMU exporting",
+    "                  one interface, which the tool then runs; OMSimulator refuses --mode for it.",
+    "fmiFlags          what the tool runs is a copy of the FMU whose resources/<prefix>_flags.json",
+    "                  holds these flags instead, which is how the Co-Simulation solver of the C",
+    "                  runtime is picked without building the FMU again. s:cvode in any of them",
+    "                  builds the FMU with --fmiFlags=s:cvode, which links CVODE into it.",
+    "fmiVersion        3.0 runs the FMI 3.0 side of an FMU built with version=\"2.0+3.0\": its copy",
+    "                  gets modelDescription.fmi3.xml as modelDescription.xml and the binaries in",
+    "                  the FMI 3.0 platform directory. 2.0 by default.",
+    "untested          set it while nobody has run the entry yet; the run then says so."
+  ],
+  "OMSimulator": {
+    "branchSuffix": "",
+    "interface": "me",
+    "resultExtension": "mat",
+    "versionArgument": "--version",
+    "arguments": "{resultArgument} --stripRoot --tempDir={tempDir} --startTime={startTime:g} --stopTime={stopTime:g}{stepSizeArgument}{modeArgument} --timeout={timeout:.0f} --tolerance={tolerance:g} {fmu}",
+    "optionalArguments": {
+      "resultArgument": "--resultFile={requestedResult}",
+      "stepSizeArgument": " --stepSize={stepSize:g}",
+      "modeArgument": " --mode={interface}"
+    }
+  },
+  "OMSimulator-cs-cvode": {
+    "branchSuffix": "-cs-cvode",
+    "interface": "cs",
+    "fmiFlags": {"s": "cvode"},
+    "resultExtension": "mat",
+    "versionArgument": "--version",
+    "arguments": "{resultArgument} --stripRoot --tempDir={tempDir} --startTime={startTime:g} --stopTime={stopTime:g}{stepSizeArgument}{modeArgument} --timeout={timeout:.0f} --tolerance={tolerance:g} {fmu}",
+    "optionalArguments": {
+      "resultArgument": "--resultFile={requestedResult}",
+      "stepSizeArgument": " --stepSize={stepSize:g}",
+      "modeArgument": " --mode={interface}"
+    }
+  },
+  "OMSimulator-cs-euler": {
+    "branchSuffix": "-cs-euler",
+    "interface": "cs",
+    "fmiFlags": {"s": "euler"},
+    "resultExtension": "mat",
+    "versionArgument": "--version",
+    "arguments": "{resultArgument} --stripRoot --tempDir={tempDir} --startTime={startTime:g} --stopTime={stopTime:g}{stepSizeArgument}{modeArgument} --timeout={timeout:.0f} --tolerance={tolerance:g} {fmu}",
+    "optionalArguments": {
+      "resultArgument": "--resultFile={requestedResult}",
+      "stepSizeArgument": " --stepSize={stepSize:g}",
+      "modeArgument": " --mode={interface}"
+    }
+  },
+  "fmpy": {
+    "interface": "me",
+    "resultExtension": "csv",
+    "versionArgument": "--version",
+    "command": "{simulator} simulate",
+    "arguments": "--output-file {result}{outputArgument} --start-time {startTime:g} --stop-time {stopTime:g} --timeout {timeout:g} --relative-tolerance {tolerance:g} --interface-type ModelExchange --solver CVode --output-interval {stepSize:g} {fmu}",
+    "optionalArguments": {
+      "outputArgument": " --output-variables {outputVariables}"
+    }
+  },
+  "fmpy-fmi3-cs-cvode": {
+    "branchSuffix": "3-cs-cvode",
+    "interface": "cs",
+    "fmiVersion": "3.0",
+    "fmiFlags": {"s": "cvode"},
+    "resultExtension": "csv",
+    "versionArgument": "--version",
+    "command": "{simulator} simulate",
+    "arguments": "--output-file {result} --start-time {startTime:g} --stop-time {stopTime:g} --timeout {timeout:g} --relative-tolerance {tolerance:g} --interface-type CoSimulation --output-interval {stepSize:g} {fmu}"
+  },
+  "fmusim": {
+    "untested": true,
+    "resultExtension": "csv",
+    "versionArgument": "--version",
+    "arguments": "--interface-type ModelExchange --output-file {result} --start-time {startTime:g} --stop-time {stopTime:g}{stepSizeArgument} {fmu}",
+    "optionalArguments": {
+      "stepSizeArgument": " --output-interval {stepSize:g}"
+    }
+  }
+}

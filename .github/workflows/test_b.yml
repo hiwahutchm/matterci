@@ -1,0 +1,94 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - jz
+
+jobs:
+  test:
+    name: GitHub Actions Test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        omc-version: [stable, nightly]
+        python-version: ['3.10']
+        include:
+          - os: windows-latest
+            omc-version: stable
+            msysEnvironment: --msysEnvironment=ucrt64
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup OpenModelica
+        uses: OpenModelica/setup-openmodelica@v1
+        with:
+          version: ${{ matrix.omc-version }}
+          packages: |
+            'omc'
+          libraries: |
+            'Modelica 4.0.0'
+          omc-diff: true
+
+      - name: Check if .CI/installLibraries.mos works
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            omc .CI/installLibraries.mos
+          fi
+
+      - name: Setup Python3
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'            # caching pip dependencies
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run library test
+        shell: bash
+        env:
+          MY_SANITY_CHECK_DIRECTORY: sanityCheck
+        run: |
+          python test.py --branch="${{ matrix.omc-version }}" --noclean --verbose ${{ matrix.msysEnvironment }} configs/sanityCheck.json
+
+      - name: Generate HTML results
+        shell: bash
+        run: python report.py --branches="${{ matrix.omc-version }}" configs/sanityCheck.json
+
+      - name: Zip HTML results
+        shell: bash
+        run: |
+          python .github/scripts/archiveResults.py "MyLibrary" "1.0.0" "${{ matrix.omc-version }}" "html/"
+
+      - name: Verify that overview.html contains simulation and verification
+        shell: bash
+        run: |
+          if ! grep -q '<tr><td><a href="${{ matrix.omc-version }}/MyLibrary_1.0.0/MyLibrary_1.0.0.html">${{ matrix.omc-version }}</a></td><td><a>2</a></td><td><a>2</a></td><td><a>2</a></td><td><a>2</a></td><td><a>2</a></td><td><a>2</a></td><td><a>2</a></td><td><a>2</a></td><td><a>2</a></td></tr></table>' overview.html; then
+            echo "Failed to find 2 simulating and 2 verifying models in overwiew.html:"
+            cat overview.html
+            exit 1
+          fi
+
+      - name: Archive sqlite3.db
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.os }}-${{ matrix.omc-version }}-sqlite3.db
+          path: |
+            sqlite3.db
+
+      - name: Archive HTML
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.os }}-${{ matrix.omc-version }}-MyLibrary.html
+          path: html/

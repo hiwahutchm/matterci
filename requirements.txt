@@ -1,0 +1,9 @@
+datetime
+joblib
+matplotlib
+monotonic
+natsort
+ompython==3.6
+psutil
+psycopg2-binary
+simplejson

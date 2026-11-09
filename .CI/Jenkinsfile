@@ -1,0 +1,1275 @@
+pipeline {
+  agent none
+  parameters {
+    booleanParam(name: 'OLDLIBS', defaultValue: false, description: 'Also test some outdated libraries')
+
+    booleanParam(name: 'v1_26', defaultValue: false, description: 'maintenance/v1.26 branch (ryzen-5950x-1)')
+    booleanParam(name: 'v1_27', defaultValue: false, description: 'maintenance/v1.27 branch (ryzen-5950x-1)')
+    booleanParam(name: 'master', defaultValue: false, description: 'master branch, simulated with the solver each model asks for, filling master (ryzen-9950x).')
+
+    booleanParam(name: 'fmi_v1_26', defaultValue: false, description: 'maintenance/v1.26 branch with FMI (ryzen-5950x-2). Every FMU is built once and simulated four ways: Model Exchange with OMSimulator filling v1.26-fmi and with FMPy filling v1.26-fmi-fmpy, Co-Simulation with OMSimulator and CVODE filling v1.26-fmi-cs-cvode and with Euler filling v1.26-fmi-cs-euler.')
+    booleanParam(name: 'fmi_v1_27', defaultValue: false, description: 'maintenance/v1.27 branch with FMI (ryzen-5950x-2). Every FMU is built once and simulated four ways: Model Exchange with OMSimulator filling v1.27-fmi and with FMPy filling v1.27-fmi-fmpy, Co-Simulation with OMSimulator and CVODE filling v1.27-fmi-cs-cvode and with Euler filling v1.27-fmi-cs-euler.')
+    booleanParam(name: 'fmi_master', defaultValue: false, description: 'master branch with FMI (ryzen-5950x-2). Every FMU is built once, serving FMI 2.0 and 3.0, and simulated five ways: FMI 2.0 Model Exchange with OMSimulator filling master-fmi and with FMPy filling master-fmi-fmpy, FMI 2.0 Co-Simulation with OMSimulator and CVODE filling master-fmi-cs-cvode and with Euler filling master-fmi-cs-euler, and FMI 3.0 Co-Simulation with FMPy and CVODE filling master-fmi3-cs-cvode.')
+
+    booleanParam(name: 'newInst_daeMode', defaultValue: false, description: 'master branch, --daeMode with -d=newInst (ryzen-5950x-2)')
+    booleanParam(name: 'newInst_newBackend', defaultValue: false, description: 'master branch, -d=newInst --newBackend, (ryzen-5950x-1)')
+    booleanParam(name: 'newBackend_daeMode', defaultValue: false, description: 'master branch, --newBackend --daeMode with -d=newInst (ryzen-5950x-2). This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'oldInst', defaultValue: false, description: 'master branch, with -d=nonewInst (ryzen-5950x-2)')
+
+    booleanParam(name: 'cpp_v1_26', defaultValue: false, description: 'maintenance/v1.26 branch, with --simCodeTarget=Cpp (ryzen-5950x-2).')
+    booleanParam(name: 'cpp_v1_27', defaultValue: false, description: 'maintenance/v1.27 branch, with --simCodeTarget=Cpp (ryzen-5950x-2).')
+    booleanParam(name: 'cpp', defaultValue: false, description: 'master branch, with --simCodeTarget=Cpp (ryzen-5950x-2).')
+    booleanParam(name: 'report_ryzen_5950x_1', defaultValue: false, description: 'Generate a report for ryzen-5950x-1 without running the tests')
+    booleanParam(name: 'report_ryzen_5950x_2', defaultValue: false, description: 'Generate a report for ryzen-5950x-2 without running the tests')
+
+    booleanParam(name: 'conversion_script', defaultValue: false, description: 'master branch with conversion script from MSL 3 to 4 (ryzen-5950x-1). This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'solvers', defaultValue: false, description: 'master branch, simulated with -s cvode, -s gbode and -s ida (ryzen-9950x). This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'dataReconciliation', defaultValue: false, description: 'master branch, the data reconciliation libraries of configs/dataReconciliation.json run with -reconcile (ryzen-5950x-1). Their reports are linked as (dr) and the job fills overview-dataReconciliation.html.')
+    booleanParam(name: 'generateSymbolicJacobian', defaultValue: false, description: 'master branch, with --generateSymbolicJacobian (ryzen-5950x-1). This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'wasm_jit', defaultValue: false, description: 'master branch, with --simCodeTarget=wasm-jit (ryzen-9950x). Every model is translated and simulated the way simulate() does, filling wasm-jit. This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'wasm_web', defaultValue: false, description: 'master branch, with --simCodeTarget=wasm-jit (ryzen-9950x), simulated the way the web omc does: the driver and the linear and nonlinear solvers in wasm, the in-wasm libm, and external "C" only from prebuilt wasm libraries. Fills wasm-web. This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'wasm_fmu', defaultValue: false, description: 'master branch, with --simCodeTarget=wasm-jit (ryzen-9950x). Every model is exported once as an unzipped wasm FMU and simulated through both of its FMI 3.0 interfaces, filling wasm-jit-me (Model Exchange) and wasm-jit-cs (Co-Simulation). This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'c_plus_rust', defaultValue: false, description: 'master branch, with --simCodeTarget=C+Rust, filling c-plus-rust (ryzen-9950x). The C code generator emits what it does for --simCodeTarget=C; the executable links libSimulationRuntimeRust instead of libSimulationRuntimeC, so the difference against master is the simulation runtime alone. This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'heavy_tests', defaultValue: false, description: 'master branch, runs one test at a time. That is, no parallel launching of tests. omc will use multiple threads for each test (-n=1 is not set unlike the other regression tests.), (r7945). This is an experimental job that does not run on a fixed schedule.')
+    booleanParam(name: 'heavy_tests_wasm', defaultValue: false, description: 'heavy_tests with --simCodeTarget=wasm-jit, filling heavy_tests_wasm (r7945). Its results are in the heavy_tests report. This is an experimental job that does not run on a fixed schedule.')
+
+    string(name: 'extraEmails', defaultValue: '', description: 'Space separated email addresses that also get the report emails of this run, besides openmodelicabuilds and the authors of the commits.')
+    string(name: 'pull_request', defaultValue: '', description: 'Test an OpenModelica pull request rather than a branch: its number, e.g. 16354. omc is built from refs/pull/<N>/merge - the pull request as it would land - the results fill a pr-<N> table, and the report compares them against the newest run of pull_request_baseline. Left empty, nothing of this runs.')
+    choice(name: 'pull_request_target', choices: ['wasm-jit', 'C'], description: 'The --simCodeTarget a pull request is simulated with. wasm-jit is the cheaper run and is compared against the wasm-jit job; C against master.')
+    choice(name: 'pull_request_solver', choices: ['default', 'gbode', 'cvode', 'ida'], description: 'The solver a pull request is simulated with: default is the one each model asks for, the others are the configs/solvers.json entries of that name. With the C target, the baseline is then that solver\'s table, which the solvers job fills; nothing fills one for wasm-jit, so set pull_request_baseline yourself or compare against the default solver.')
+    string(name: 'pull_request_simflags', defaultValue: '', description: 'Simulation flags appended to every model\'s, after those of pull_request_solver, e.g. -gbm=esdirk3 to run gbode with another method.')
+    string(name: 'pull_request_baseline', defaultValue: '', description: 'The branch a pull request is compared against. Left empty, the one pull_request_target is tested by: wasm-jit for wasm-jit, master for C, or for C with a pull_request_solver its own table. Its newest run has to come from pull_request_node, or the report compares the machines as much as the pull request.')
+    string(name: 'pull_request_config', defaultValue: 'configs/conf.json', description: 'What a pull request run tests. A full run takes days, so a smaller configuration file is often the better question to ask.')
+    choice(name: 'pull_request_node', choices: ['ryzen-9950x', 'ryzen-5950x-1', 'ryzen-5950x-2-1', 'r7945-1'], description: 'The machine a pull request runs on. The default is the one that produces the master and wasm-jit runs it is compared against.')
+    booleanParam(name: 'pull_request_comment', defaultValue: false, description: 'Post the summary of a pull request run as a comment on the pull request, replacing the one an earlier run posted. Needs an OpenModelica-Hudson credential; without it the report is still written and published, only not commented.')
+    booleanParam(name: 'drop_stale_pull_request_tables', defaultValue: false, description: 'Drop the pr-<N> tables of pull requests that have been merged or closed, and of those tested more than 60 days ago. The reports published for them are not touched.')
+  }
+  environment {
+    LC_ALL = 'C.UTF-8'
+    // Where the results go. The scripts take it from here instead of a --db
+    // option on every single invocation.
+    LIBTEST_DB = 'postgresql://om@openmodelica.org/omdb'
+  }
+  stages {
+    stage('test') { parallel {
+
+      stage('v1.26') {
+        agent {
+          node {
+            label 'ryzen-5950x-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.v1_26 }
+        }
+        steps {
+          runRegressiontest('maintenance/v1.26', 'v1.26', '', '', false, '', '', false, false)
+        }
+      }
+
+      stage('v1.27') {
+        agent {
+          node {
+            label 'ryzen-5950x-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.v1_27 }
+        }
+        steps {
+          runRegressiontest('maintenance/v1.27', 'v1.27', '', '', false, '', '', false, false)
+        }
+      }
+
+      stage('master') {
+        agent {
+          node {
+            label 'ryzen-9950x'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.master }
+        }
+        steps {
+          runRegressiontest('master', 'master', '', '', false, '', '', false, false, 0, 'configs/conf.json', '', '.CI/testing', null, null)
+        }
+      }
+
+      stage('solvers') {
+        agent {
+          node {
+            label 'ryzen-9950x'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.solvers }
+        }
+        steps {
+          runRegressiontest('master', 'master', '', '', false, '', '', false, false, 0, 'configs/conf.json', '', '.CI/testing', null,
+                            ['cvode', 'gbode', 'ida'])
+        }
+      }
+
+      stage('conversion script') {
+        agent {
+          node {
+            label 'ryzen-5950x-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.conversion_script }
+        }
+        steps {
+          runRegressiontest('master', 'conversion', '', '', false, '', '', false, true)
+        }
+      }
+
+      stage('pull request') {
+        agent {
+          node {
+            label "${params.pull_request_node ?: 'ryzen-9950x'}"
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { pullRequest() }
+        }
+        steps {
+          script {
+            if (!(pullRequest() ==~ /[0-9]+/)) {
+              error "pull_request is a pull request number; got '${params.pull_request}'"
+            }
+            if (pullRequestSimflags().contains("'")) {
+              error "pull_request_simflags cannot contain a single quote; got '${pullRequestSimflags()}'"
+            }
+          }
+          // Before the clone, the reset and the build: a number that is not a
+          // pull request costs minutes to find out about otherwise. Issues and
+          // pull requests share one numbering, so an issue number gets this far.
+          sh """
+          if ! git ls-remote --exit-code https://github.com/OpenModelica/OpenModelica.git 'refs/pull/${pullRequest()}/*' > /dev/null; then
+            echo "OpenModelica/OpenModelica has no pull request ${pullRequest()}. Issues and pull requests share one numbering there, so check that ${pullRequest()} is not the number of an issue."
+            exit 1
+          fi
+          """
+          // One build of omc per pull request is kept, as for a branch, and they
+          // accumulate: a pull request is tested once and never again. The
+          // second line is the layout of the runs before they moved under pr/.
+          sh '''
+          find "$HOME/saved_omc/pr" -mindepth 1 -maxdepth 1 -type d -mtime +14 -exec rm -rf {} ";" 2> /dev/null || true
+          find "$HOME/saved_omc" -mindepth 1 -maxdepth 1 -name "pr-*" -type d -mtime +14 -exec rm -rf {} ";" || true
+          '''
+          script {
+            def config = params.pull_request_config ?: 'configs/conf.json'
+            def solverFlags = pullRequestSolver() == 'default' ? '' : "--solverflags=${pullRequestSolver()}"
+            if (pullRequestTarget() == 'C') {
+              runRegressiontest("pr/${pullRequest()}", "pr/${pullRequest()}", '', '', false, pullRequestSimflags(), solverFlags, false, false, 0, config)
+            } else {
+              runRegressiontest("pr/${pullRequest()}", "pr/${pullRequest()}", 'setCommandLineOptions("--simCodeTarget=wasm-jit")', '', false, pullRequestSimflags(), "--nobuildmodel ${solverFlags}", false, false, 0, config,
+                                wasmCmakeFlags())
+            }
+          }
+        }
+      }
+
+      stage('newInst-newBackend') {
+        agent {
+          node {
+            label 'ryzen-5950x-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.newInst_newBackend }
+        }
+        steps {
+          runRegressiontest('master', 'newInst-newBackend', 'setCommandLineOptions("-d=newInst,-frontEndUnitCheck --newBackend")', '', false, '', '', false, false)
+        }
+      }
+
+      stage('v1.26 FMI') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.fmi_v1_26 }
+        }
+        steps {
+          runRegressiontest('maintenance/v1.26', 'v1.26-fmi', '', omsimulatorHash(), false, '', '', false, false, 0, 'configs/conf.json', '', '.CI/testing', fmiSimulators())
+        }
+      }
+      stage('v1.27 FMI') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.fmi_v1_27 }
+        }
+        steps {
+          runRegressiontest('maintenance/v1.27', 'v1.27-fmi', '', omsimulatorHash(), false, '', '', false, false, 0, 'configs/conf.json', '', '.CI/testing', fmiSimulators())
+        }
+      }
+      stage('master FMI') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.fmi_master }
+        }
+        steps {
+          runRegressiontest('master', 'master-fmi', '', 'origin/master', false, '', '', false, false, 0, 'configs/conf.json', '', '.CI/testing', fmiSimulators(true))
+        }
+      }
+
+      stage('newInst-daeMode') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.newInst_daeMode }
+        }
+        steps {
+          runRegressiontest('master', 'newInst-daeMode', 'setCommandLineOptions("-d=newInst,-frontEndUnitCheck --daeMode=true")', '', false, '', '', false, false)
+        }
+      }
+      stage('newBackend-daeMode') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.newBackend_daeMode }
+        }
+        steps {
+          runRegressiontest('master', 'newBackend-daeMode', 'setCommandLineOptions("-d=newInst,-frontEndUnitCheck --newBackend --daeMode=true")', '', false, '', '', false, false)
+        }
+      }
+      stage('oldInst') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.oldInst }
+        }
+        steps {
+          runRegressiontest('master', 'oldInst', 'setCommandLineOptions("-d=nonewInst")', '', false, '', '', false, false)
+        }
+      }
+      stage('wasm-jit') {
+        agent {
+          node {
+            label 'ryzen-9950x'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.wasm_jit }
+        }
+        steps {
+          // --nobuildmodel: the model is translated, compiled and simulated by one simulate(),
+          // so omc reports the JIT compile as the build time rather than leaving it in the
+          // simulation the way a resimulate does.
+          runRegressiontest('master', 'wasm-jit', 'setCommandLineOptions("--simCodeTarget=wasm-jit")', '', false, '', '--nobuildmodel', false, false, 0, 'configs/conf.json',
+                            wasmCmakeFlags())
+        }
+      }
+      stage('wasm-fmu') {
+        agent {
+          node {
+            label 'ryzen-9950x'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.wasm_fmu }
+        }
+        steps {
+          // --branch=wasm-jit and no runner of its own fills that table: the two runners write
+          // wasm-jit-me and wasm-jit-cs, beside the wasm-jit the stage above fills.
+          runRegressiontest('master', 'wasm-jit', 'setCommandLineOptions("--simCodeTarget=wasm-jit")', '', false, '', '--wasmfmu=me,cs', false, false, 0, 'configs/conf.json',
+                            wasmCmakeFlags())
+        }
+      }
+      stage('wasm-web') {
+        agent {
+          node {
+            label 'ryzen-9950x'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.wasm_web }
+        }
+        steps {
+          // Its own build (~/saved_omc/wasm-web): the runtime links the web's in-wasm
+          // driver and solvers, which the environment below selects.
+          withEnv(wasmWebEnv()) {
+            runRegressiontest('master', 'wasm-web', 'setCommandLineOptions("--simCodeTarget=wasm-jit")', '', false, '', '--nobuildmodel', false, false, 0, 'configs/conf.json',
+                              wasmCmakeFlags() + ' -DRUST_OMC_WASM_INWASM_DRIVER=ON')
+          }
+        }
+      }
+      stage('C+Rust') {
+        agent {
+          node {
+            label 'ryzen-9950x'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.c_plus_rust }
+        }
+        steps {
+          runRegressiontest('master', 'c-plus-rust', 'setCommandLineOptions("--simCodeTarget=C+Rust")', '', false, '', '', false, false)
+        }
+      }
+      stage('generateSymbolicJacobian') {
+        agent {
+          node {
+            label 'ryzen-5950x-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.generateSymbolicJacobian }
+        }
+        steps {
+          runRegressiontest('master', 'generateSymbolicJacobian', 'setCommandLineOptions("--generateSymbolicJacobian")', '', false, '', '', false, false)
+        }
+      }
+      stage('dataReconciliation') {
+        agent {
+          node {
+            label 'ryzen-5950x-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.dataReconciliation }
+        }
+        steps {
+          runRegressiontest('master', 'dataReconciliation', '', '', false, '', '', false, false, 0, 'configs/dataReconciliation.json')
+        }
+      }
+      stage('heavy_tests') {
+        agent {
+          node {
+            label 'r7945-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.heavy_tests }
+        }
+        steps {
+            runRegressiontest('master', 'heavy_tests', '', '', false, '', '', false, false, 1, 'configs/heavy_tests.json')
+        }
+      }
+      stage('heavy_tests_wasm') {
+        agent {
+          node {
+            label 'r7945-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.heavy_tests_wasm }
+        }
+        steps {
+            runRegressiontest('master', 'heavy_tests_wasm', 'setCommandLineOptions("--simCodeTarget=wasm-jit")', '', false, '', '--nobuildmodel', false, false, 1, 'configs/heavy_tests.json',
+                              wasmCmakeFlags())
+        }
+      }
+
+      stage('C++ v1.26') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.cpp_v1_26 }
+        }
+        steps {
+          runRegressiontest('maintenance/v1.26', 'v1.26-cpp', 'setCommandLineOptions("--simCodeTarget=Cpp")', '', false, '', '', false, false)
+        }
+      }
+      stage('C++ v1.27') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.cpp_v1_27 }
+        }
+        steps {
+          runRegressiontest('maintenance/v1.27', 'v1.27-cpp', 'setCommandLineOptions("--simCodeTarget=Cpp")', '', false, '', '', false, false)
+        }
+      }
+
+      stage('C++') {
+        agent {
+          node {
+            label 'ryzen-5950x-2-1'
+            customWorkspace 'ws/OpenModelicaLibraryTestingWork'
+          }
+        }
+        options { skipDefaultCheckout() }
+        when {
+          beforeAgent true
+          expression { params.cpp }
+        }
+        steps {
+          runRegressiontest('master', 'cpp', 'setCommandLineOptions("--simCodeTarget=Cpp")', '', false, '', '', false, false)
+        }
+      }
+    } }
+    stage('report') {
+      agent {
+        dockerfile {
+          label 'linux'
+          dir '.CI/build-dep'
+          customWorkspace 'ws/OpenModelicaLibraryTestingReport'
+          args '-e IDA_EMAIL_USR=$IDA_EMAIL_USR -e IDA_EMAIL_PSW=$IDA_EMAIL_PSW'
+        }
+      }
+      when {
+        beforeAgent true
+        expression { params.v1_25 || params.v1_26 || params.v1_27 || params.master || params.conversion_script || params.report_ryzen_5950x_1 || params.report_ryzen_5950x_2 || params.newInst_newBackend || params.generateSymbolicJacobian || params.dataReconciliation || params.heavy_tests || params.heavy_tests_wasm || params.fmi_v1_25 || params.fmi_v1_26 || params.fmi_v1_27 || params.fmi_master || params.newInst_daeMode || params.newBackend_daeMode || params.oldInst || params.cpp || params.solvers || params.wasm_jit || params.wasm_fmu || params.wasm_web || params.c_plus_rust}
+      }
+      environment {
+        GITBRANCHES = 'maintenance/v1.20 maintenance/v1.21 maintenance/v1.22 maintenance/v1.23 maintenance/v1.24 maintenance/v1.25 maintenance/v1.26 maintenance/v1.27 master newInst-newBackend'
+        GITBRANCHES_FMI = 'maintenance/v1.20-fmi maintenance/v1.21-fmi maintenance/v1.22-fmi maintenance/v1.23-fmi maintenance/v1.24-fmi maintenance/v1.25-fmi maintenance/v1.26-fmi maintenance/v1.27-fmi maintenance/v1.22-fmi-fmpy maintenance/v1.23-fmi-fmpy maintenance/v1.24-fmi-fmpy maintenance/v1.25-fmi-fmpy maintenance/v1.26-fmi-fmpy maintenance/v1.27-fmi-fmpy master-fmi master-fmi-fmpy maintenance/v1.26-fmi-cs-cvode maintenance/v1.27-fmi-cs-cvode master-fmi-cs-cvode maintenance/v1.26-fmi-cs-euler maintenance/v1.27-fmi-cs-euler master-fmi-cs-euler master-fmi3-cs-cvode'
+        GITBRANCHES_NEWINST = 'oldInst'
+        GITBRANCHES_DAE = 'newInst-daeMode'
+        GITBRANCHES_NEWBACKEND_DAE = 'newBackend-daeMode'
+        GITBRANCHES_CPP = 'v1.19-cpp v1.20-cpp v1.21-cpp v1.22-cpp v1.23-cpp v1.24-cpp v1.25-cpp cpp v1.26-cpp v1.27-cpp'
+        GITBRANCHES_WASM_JIT = 'wasm-jit-me wasm-jit-cs wasm-jit wasm-web'
+        GITBRANCHES_C_PLUS_RUST = 'c-plus-rust'
+        GITBRANCHES_SPECIAL = 'master newInst-newBackend'
+        PYTHONIOENCODING = 'utf-8'
+        IDA_EMAIL = credentials('IDA email')
+        // A secret file holding one pgpass line; libpq reads the password from
+        // it, so it never reaches a command line or the build log. It is bound
+        // per stage because writing the file needs the workspace of a node,
+        // which the pipeline as a whole does not have (agent none).
+        PGPASSFILE = credentials('omdb-pgpass')
+      }
+      steps {
+        sh 'rm -rf *.html history pending-reports.json'
+        sh '''
+        if ! test -d OpenModelica; then
+          git clone https://openmodelica.org/git-readonly/OpenModelica.git
+        fi
+        cd OpenModelica
+        git fetch
+        '''
+        sh './clean-empty-omcversion-dates.py'
+
+        // The shell takes extraEmails from the environment, so its value is never
+        // part of the command.
+        sh "./all-reports.py --email --extra-emails=\"\$extraEmails\" --omcgitdir=OpenModelica ${env.GITBRANCHES} ${env.GITBRANCHES_FMI} ${env.GITBRANCHES_NEWINST} ${env.GITBRANCHES_DAE} ${env.GITBRANCHES_NEWBACKEND_DAE} ${env.GITBRANCHES_CPP} ${env.GITBRANCHES_WASM_JIT} ${env.GITBRANCHES_C_PLUS_RUST} conversion heavy_tests heavy_tests_wasm generateSymbolicJacobian dataReconciliation gbode cvode ida"
+        sh "./all-plots.py ${env.GITBRANCHES} ${env.GITBRANCHES_FMI} ${env.GITBRANCHES_NEWINST} ${env.GITBRANCHES_DAE} ${env.GITBRANCHES_NEWBACKEND_DAE} ${env.GITBRANCHES_CPP} ${env.GITBRANCHES_WASM_JIT} ${env.GITBRANCHES_C_PLUS_RUST} conversion heavy_tests heavy_tests_wasm generateSymbolicJacobian dataReconciliation gbode cvode ida"
+
+        // Recorded and announced only once they are up: a report the database
+        // knows about is never generated again, so one that a later failure in
+        // this stage stops from being uploaded would be lost for good.
+        sshPublisher(publishers: [sshPublisherDesc(configName: 'LibraryTestingReports', transfers: [sshTransfer(sourceFiles: 'history/**')])])
+        sh './publish-reports.py'
+
+        sh "./report.py --branches='${env.GITBRANCHES} ${env.GITBRANCHES_WASM_JIT}' configs/conf.json configs/conf-old.json configs/conf-nonstandard.json"
+        sh 'mv overview.html overview-combined.html'
+        sh "./report.py --branches='${env.GITBRANCHES} ${env.GITBRANCHES_WASM_JIT}' configs/conf-old.json"
+        sh "mv overview.html overview-old-libs.html"
+        sh "./report.py --branches='${env.GITBRANCHES} ${env.GITBRANCHES_WASM_JIT}' configs/conf-nonstandard.json"
+        sh "mv overview.html overview-nonstandard-libs.html"
+        sh "./report.py --branches='${env.GITBRANCHES_SPECIAL} conversion' configs/conf.json"
+        sh "mv overview.html overview-special-jobs.html"
+
+        sh "./report.py --branches='generateSymbolicJacobian' configs/conf.json"
+        sh "mv overview.html overview-generateSymbolicJacobian.html"
+
+        sh "./report.py --branches='dataReconciliation' configs/dataReconciliation.json"
+        sh "mv overview.html overview-dataReconciliation.html"
+
+        sh "./report.py --branches='heavy_tests heavy_tests_wasm' configs/heavy_tests.json"
+        sh "mv overview.html overview-heavy_tests.html"
+
+        sh "./report.py --branches='${env.GITBRANCHES_NEWINST}' configs/conf.json"
+        sh "mv overview.html overview-oldinst.html"
+        sh "./report.py --branches='${env.GITBRANCHES_NEWINST}' configs/conf.json configs/conf-old.json configs/conf-nonstandard.json"
+        sh "mv overview.html overview-combined-oldinst.html"
+        sh "./report.py --branches='${env.GITBRANCHES_NEWINST}' configs/conf-old.json"
+        sh "mv overview.html overview-old-libs-oldinst.html"
+        sh "./report.py --branches='${env.GITBRANCHES_NEWINST}' configs/conf-nonstandard.json"
+        sh "mv overview.html overview-nonstandard-libs-oldinst.html"
+
+        sh "./report.py --branches='${env.GITBRANCHES_FMI}' configs/conf.json"
+        sh "mv overview.html overview-fmi.html"
+        sh "./report.py --branches='${env.GITBRANCHES_FMI}' configs/conf.json configs/conf-old.json configs/conf-nonstandard.json"
+        sh "mv overview.html overview-combined-fmi.html"
+        sh "./report.py --branches='${env.GITBRANCHES_FMI}' configs/conf-old.json"
+        sh "mv overview.html overview-old-libs-fmi.html"
+        sh "./report.py --branches='${env.GITBRANCHES_FMI}' configs/conf-nonstandard.json"
+        sh "mv overview.html overview-nonstandard-libs-fmi.html"
+
+        sh "./report.py --branches='${env.GITBRANCHES_DAE}' configs/conf.json"
+        sh "mv overview.html overview-dae.html"
+        sh "./report.py --branches='${env.GITBRANCHES_DAE}' configs/conf.json configs/conf-old.json configs/conf-nonstandard.json"
+        sh "mv overview.html overview-combined-dae.html"
+        sh "./report.py --branches='${env.GITBRANCHES_DAE}' configs/conf-old.json"
+        sh "mv overview.html overview-old-libs-dae.html"
+        sh "./report.py --branches='${env.GITBRANCHES_DAE}' configs/conf-nonstandard.json"
+        sh "mv overview.html overview-nonstandard-libs-dae.html"
+
+        sh "./report.py --branches='${env.GITBRANCHES_NEWBACKEND_DAE}' configs/conf.json"
+        sh "mv overview.html overview-newbackend-dae.html"
+        sh "./report.py --branches='${env.GITBRANCHES_NEWBACKEND_DAE}' configs/conf.json configs/conf-old.json configs/conf-nonstandard.json"
+        sh "mv overview.html overview-combined-newbackend-dae.html"
+        sh "./report.py --branches='${env.GITBRANCHES_NEWBACKEND_DAE}' configs/conf-old.json"
+        sh "mv overview.html overview-old-libs-newbackend-dae.html"
+        sh "./report.py --branches='${env.GITBRANCHES_NEWBACKEND_DAE}' configs/conf-nonstandard.json"
+        sh "mv overview.html overview-nonstandard-libs-newbackend-dae.html"
+
+        sh "./report.py --branches='cvode gbode ida master' configs/conf.json"
+        sh "mv overview.html overview-solvers.html"
+
+        // The ways a wasm-jit model is simulated, against master: the plain
+        // simulation path, the two FMI 3.0 interfaces of one exported wasm FMU,
+        // which share an export and differ only in simulation and verification,
+        // and the web omc's in-wasm path.
+        sh "./report.py --branches='master ${env.GITBRANCHES_WASM_JIT}' configs/conf.json"
+        sh "mv overview.html overview-wasm-jit.html"
+
+        sh "./report.py --branches='${env.GITBRANCHES_CPP}' configs/conf.json"
+        sh "mv overview.html overview-c++.html"
+
+        sh "./report.py --branches='${env.GITBRANCHES} ${env.GITBRANCHES_C_PLUS_RUST}' configs/conf.json"
+
+        sh 'date'
+        sh 'find overview*.html history -type f | wc -l'
+        sh 'find overview*.html history'
+
+        sshPublisher(publishers: [sshPublisherDesc(configName: 'LibraryTestingReports', transfers: [sshTransfer(sourceFiles: 'overview*.html')])])
+      }
+    }
+
+    stage('drop stale pull request tables') {
+      agent {
+        dockerfile {
+          label 'linux'
+          dir '.CI/build-dep'
+          customWorkspace 'ws/OpenModelicaLibraryTestingReport'
+        }
+      }
+      when {
+        beforeAgent true
+        expression { params.drop_stale_pull_request_tables ?: false }
+      }
+      environment {
+        PGPASSFILE = credentials('omdb-pgpass')
+      }
+      steps {
+        sh './drop-pr-tables.py --yes'
+      }
+    }
+
+    /* A pull request is not reported on by the stage above: that one compares a
+     * branch against its own previous run, which a pull request has none of, and
+     * regenerating every overview for a job that tested one thing would take
+     * longer than the report itself. */
+    stage('pull request report') {
+      agent {
+        dockerfile {
+          label 'linux'
+          dir '.CI/build-dep'
+          customWorkspace 'ws/OpenModelicaLibraryTestingReport'
+        }
+      }
+      when {
+        beforeAgent true
+        expression { pullRequest() }
+      }
+      environment {
+        PYTHONIOENCODING = 'utf-8'
+        PGPASSFILE = credentials('omdb-pgpass')
+      }
+      steps {
+        script {
+          if (!(pullRequest() ==~ /[0-9]+/)) {
+            error "pull_request is a pull request number; got '${params.pull_request}'"
+          }
+        }
+        sh 'rm -rf history'
+        sh "./pr-report.py '${pullRequest()}' --baseline='${pullRequestBaseline()}'"
+        // Uploaded before it is announced, as the branch reports are: the
+        // comment links to the report, and nothing after this may be what stops
+        // it from being published.
+        sshPublisher(publishers: [sshPublisherDesc(configName: 'LibraryTestingReports', transfers: [sshTransfer(sourceFiles: 'history/**')])])
+        // The summary is in the build log as well, so a run without a token
+        // still leaves it somewhere to copy from.
+        sh "cat 'history/pr/${pullRequest()}/00_comment.md'"
+        script {
+          if (params.pull_request_comment) {
+            // Whoever the token belongs to is who the comment comes from.
+            withCredentials([string(credentialsId: 'OpenModelica-Hudson', variable: 'GITHUB_TOKEN')]) {
+              sh "./pr-report.py '${pullRequest()}' --comment-only"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+/**
+  * The pull request this job is testing, or "" when it is testing branches.
+  *
+  * A job only learns of a parameter that has been added to it once a build has
+  * run with the definition, so the first build after this file changes sees the
+  * new ones as null - which is every build of the pipeline, not only one asking
+  * for a pull request, because the stages that ignore them still have to decide
+  * whether to run. Everything that reads them therefore falls back to what the
+  * definition says the default is.
+  */
+def pullRequest() {
+  return (params.pull_request ?: '').trim()
+}
+
+def pullRequestTarget() {
+  return params.pull_request_target ?: 'wasm-jit'
+}
+
+def pullRequestSolver() {
+  return params.pull_request_solver ?: 'default'
+}
+
+def pullRequestSimflags() {
+  return (params.pull_request_simflags ?: '').trim()
+}
+
+def pullRequestBaseline() {
+  def baseline = (params.pull_request_baseline ?: '').trim()
+  if (baseline) {
+    return baseline
+  }
+  if (pullRequestTarget() == 'C') {
+    return pullRequestSolver() == 'default' ? 'master' : pullRequestSolver()
+  }
+  return 'wasm-jit'
+}
+
+/**
+  * The cores of the node a build is running on, physical and logical, asked for
+  * the way the OpenModelica job asks (numPhysicalCPU in .CI/common.groovy
+  * there), so that a machine is built on as itself rather than as the machine
+  * the numbers were written for.
+  *
+  * Unlike that one the answer is not stashed in the environment: this pipeline
+  * is agent none and its stages run on several machines within one build, so a
+  * cached answer would be the first node's. An override set on the node itself
+  * is still honoured.
+  */
+def numPhysicalCPU() {
+  if (env.JENKINS_NUM_PHYSICAL_CPU) {
+    return env.JENKINS_NUM_PHYSICAL_CPU
+  }
+  return sh(script: 'lscpu -p | egrep -v "^#" | sort -u -t, -k 2,4 | wc -l', returnStdout: true).trim()
+}
+
+def numLogicalCPU() {
+  if (env.JENKINS_NUM_LOGICAL_CPU) {
+    return env.JENKINS_NUM_LOGICAL_CPU
+  }
+  return sh(script: 'nproc', returnStdout: true).trim()
+}
+
+def omsimulatorHash() {
+  return 'master'
+}
+/**
+  * Installs the libraries a run tests, with the image's /usr/bin/omc, and returns the home
+  * directory holding them. The conversion script uses the omc that was just built instead.
+  */
+def installLibraries(boolean removePackageOrder, boolean conversionScript, name, String omhomeTestedOMC, Closure runSh) {
+  sh "rm -rf '${env.HOME}/saved_omc/libraries/.openmodelica/libraries'"
+  sh "mkdir -p '${env.HOME}/saved_omc/libraries/'"
+  runSh("HOME='${env.HOME}/saved_omc/libraries/' /usr/bin/omc OpenModelicaLibraryTesting/.CI/installLibraries.mos")
+  if (removePackageOrder) {
+    sh "find '${env.HOME}/saved_omc/libraries/' -name package.order -exec rm '{}' ';'"
+  }
+  echo "installLibraries removePackageOrder: ${removePackageOrder} conversionScript: ${conversionScript} name: ${name}"
+  if (conversionScript) {
+    runSh("""
+    cd '${WORKSPACE}/OpenModelicaLibraryTesting'
+    OPENMODELICAHOME="${omhomeTestedOMC}" ./conversionscript.py --diff --allowErrorsInDiff '${env.HOME}/saved_omc/libraries/.openmodelica/libraries'
+    scp converted-libraries/.openmodelica/libraries/*.diff 'libraries.openmodelica.org:/var/www/libraries.openmodelica.org/branches/${name}'
+    """)
+    return "${WORKSPACE}/OpenModelicaLibraryTesting/converted-libraries"
+  } else {
+    return "${env.HOME}/saved_omc/libraries"
+  }
+}
+
+
+/**
+  * `docker run` flags capping the container's cgroup at 90% of the node's RAM. test.py limits one
+  * test at a time, not the sum of the parallel ones. --memory-swap has to repeat the limit; docker
+  * reads 0 as "unset" and then allows swapping.
+  */
+def memoryLimitArgs() {
+  def mb = sh(script: '''awk '/^MemTotal:/ { print int($2 / 1024 * 0.85) }' /proc/meminfo''',
+              returnStdout: true).trim()
+  echo "Test container memory limit: ${mb} MB, no swap"
+  return "--memory=${mb}m --memory-swap=${mb}m"
+}
+
+/**
+  * Runs `body` with the environment of the shared Rust compile cache of the OpenModelica job
+  * (OpenModelica/.CI/sccache/), which builds the same commits first. Hitting its keys needs the
+  * same rust settings (opt-level 2, -DRUST_OMC_THREADS=4 at the call site), the same toolchain
+  * (hence the same docker image) and SCCACHE_BASEDIRS set to the checkout directory, which is a
+  * subdirectory of the workspace here but the workspace itself there.
+  *
+  * The server is started by sccachePreamble() instead, since a build in a container cannot use
+  * one started outside it.
+  */
+def withSccache(Closure body) {
+  withCredentials([string(credentialsId: 'sccache-ci-secret-key',
+                          variable: 'AWS_SECRET_ACCESS_KEY')]) {
+    withEnv(['RUSTC_WRAPPER=sccache',
+             'SCCACHE_BUCKET=omc-sccache',
+             'SCCACHE_ENDPOINT=https://sccache.openmodelica.org',
+             'SCCACHE_REGION=auto',
+             'SCCACHE_S3_USE_SSL=true',
+             'AWS_ACCESS_KEY_ID=sccache-ci',
+             'CARGO_INCREMENTAL=0',
+             'CARGO_PROFILE_RELEASE_OPT_LEVEL=2',
+             "SCCACHE_BASEDIRS=${env.WORKSPACE}/OpenModelica"]) {
+      body()
+    }
+  }
+}
+
+/**
+  * Prepended to a build running under withSccache: starts a server with the current environment
+  * (a running one keeps the one it was started with), or drops RUSTC_WRAPPER if there is no sccache.
+  */
+def sccachePreamble() {
+  return '''
+  if command -v sccache > /dev/null; then
+    log="`mktemp`"
+    sccache --stop-server > /dev/null 2>&1 || true
+    SCCACHE_ERROR_LOG="$log" SCCACHE_LOG=warn sccache --start-server
+    sccache --show-stats
+    if grep -qiE "storage (write )?check failed|read-only storage|cache storage failed" "$log"; then
+      echo "WARNING: the sccache S3 backend is unusable; building without a shared cache:" >&2
+      cat "$log" >&2
+    fi
+    rm -f "$log"
+  else
+    echo "sccache was not found; building without a compile cache"
+    unset RUSTC_WRAPPER
+  fi
+  '''
+}
+
+/**
+  * Whether omc is built with cmake for `branch`, rather than with Autoconf and Makefiles.
+  *
+  * The Autoconf+Make build is being removed from OpenModelica (OpenModelica/OpenModelica#14387),
+  * so master - and the pull requests that would be merged into it - is built with cmake. The
+  * maintenance branches are still released from the Autoconf build and keep it until they are
+  * dropped.
+  */
+def buildsWithCMake(branch) {
+  return !branch.startsWith('maintenance/')
+}
+
+/**
+  * Launches the test.py script with the given options.
+  *
+  * @param branch:              OpenModelica branch to test. Will checkout the branch and build omc from it.
+  * @param name:                Unique name of the library test. Passed to test.py via flag `--branch`.
+  *                             Also used for stashing omc and uploading results to https://test.openmodelica.org.
+  * @param extraFlags:          Additional compiler flags passed to test.py via flag `--extraflags`.
+  * @param omsHash:             OMSimulator SHA.
+  * @param omcompiler:          Checkout old OMCompiler submodule. Should be `false` nowadays.
+  * @param extrasimflags:       Additional simulation flags passed to test.py via flag `--extrasimflags`.
+  * @param testFlags:           Additional flags passed to test.py verbatim, e.g. `--nobuildmodel`.
+  * @param removePackageOrder:  Passed to `installLibraries`.
+  * @param conversionScript:    Passed to `installLibraries`.
+  * @param jobs:                The number of tests/jobs to launch in parallel.
+  *                             By default this is set to `0` which means launch as many tests as there are available
+  *                             physical cpus on the machine'.
+  * @param libs_config_file:    The config file to be used for testing.
+  *                             This file specifies which libraries to test and what options to use for them.
+  * @param cmakeFlags:          Target-specific cmake flags, e.g. `-DOM_OMC_ENABLE_RUST=ON`, added to the
+  *                             shared release flags. Only for the branches built with cmake, see
+  *                             buildsWithCMake().
+  * @param dockerfile:          Directory with a Dockerfile, relative to the testing repository. Defaults to
+  *                             `.CI/testing`, the image every job runs in: the omc build, the OMSimulator
+  *                             build and test.py happen inside it, and only the steps using the node's own
+  *                             omc stay outside. Passing `''` runs the job on the node itself.
+  */
+/* The FMI simulators of an FMI job, which builds every FMU once and simulates it with all of them,
+ * filling <branch>-fmi, <branch>-fmi-cs-cvode, <branch>-fmi-cs-euler and <branch>-fmi-fmpy.
+ * With fmi3, the FMU also serves FMI 3.0 (buildModelFMU version="2.0+3.0", master only), which
+ * FMPy runs as Co-Simulation with CVODE into <branch>3-cs-cvode, e.g. master-fmi3-cs-cvode. */
+def fmiSimulators(fmi3 = false) {
+  return ['OMSimulator', 'OMSimulator-cs-cvode', 'OMSimulator-cs-euler', 'fmpy'] +
+         (fmi3 ? ['fmpy-fmi3-cs-cvode'] : [])
+}
+
+/* The cmake flags of an omc that can translate to wasm-jit. The wasm-jit and
+ * wasm-fmu jobs share the build cached in ~/saved_omc/wasm-jit, so they have to
+ * ask for the same one. */
+def wasmCmakeFlags() {
+  return '-DOM_OMC_ENABLE_RUST=ON -DRUST_OMC_CI=ON -DRUST_OMC_THREADS=4 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache'
+}
+
+/* What makes the wasm-web job's omc simulate the way the web omc does. */
+def wasmWebEnv() {
+  return ['OMC_WASM_INWASM_DRIVER=1',
+          'OMC_WASM_HOST_LIN_SOLVE=0',
+          'OMC_WASM_HOST_LIBM=0',
+          'OMC_WASM_NATIVE_EXTERNALS=0']
+}
+
+def runRegressiontest(branch, name, extraFlags, omsHash, omcompiler, extrasimflags, testFlags, boolean removePackageOrder, boolean conversionScript, int jobs=0, libs_config_file = 'configs/conf.json', cmakeFlags = '', dockerfile = '.CI/testing', fmiSimulators = null, solvers = null) {
+  sh '''
+  find /tmp  -name "*openmodelica.hudson*" -exec rm {} ";" || true
+
+  if test -z "$WORKSPACE"; then
+    echo "Odd workspace"
+    exit 1
+  fi
+  '''
+
+  // Checked out before the omc build rather than just before test.py: it provides the Dockerfile.
+  sh """
+  if test ! -d OpenModelicaLibraryTesting; then
+    git clone --recursive https://openmodelica.org/git-readonly/OpenModelicaLibraryTesting.git OpenModelicaLibraryTesting
+  fi
+  cd OpenModelicaLibraryTesting
+  git fetch
+  git reset --hard origin/master
+  """
+
+  def image = null
+  if (dockerfile) {
+    // Build context is the Dockerfile directory; the workspace has a directory per tested model.
+    sh "cp OpenModelicaLibraryTesting/requirements.txt OpenModelicaLibraryTesting/${dockerfile}/"
+    // Tagged after the Dockerfile rather than after the job, so that jobs sharing an image share
+    // its tag as well and a node keeps one of them instead of one per job it has ever run.
+    image = docker.build("openmodelica-library-testing:${dockerfile.tokenize('/').last()}",
+                         "--pull OpenModelicaLibraryTesting/${dockerfile}")
+  }
+  // --init reaps the omc processes test.py orphans. ssh refuses to run for a uid it cannot look
+  // up, so the node's passwd entry is needed to publish the results. The home holds the cached omc
+  // build, the libraries (HOME during the test) and the ssh key; test.py writes a hash next to
+  // every reference file. rust-cargo-registry is the volume the OpenModelica job uses. The MQTT
+  // example of Modelica_DeviceDrivers gets the broker test.py starts instead of the public one.
+  def dockerArgs = "--init" +
+                   (image ? " ${memoryLimitArgs()}" : '') +
+                   " --add-host test.mosquitto.org:127.0.0.1" +
+                   " -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro" +
+                   " -v ${env.HOME}:${env.HOME}" +
+                   " -v /mnt/ReferenceFiles:/mnt/ReferenceFiles" +
+                   " --mount type=volume,source=rust-cargo-registry,target=/opt/rust/cargo/registry"
+  // Only in a container is the cgroup this job's own; a breach kills the greediest omc, which need
+  // not be the model that caused it. memory.stat says what kind of memory it was (anon, file,
+  // shmem, slab), and the process list what test.py left behind.
+  def cgroupReport = image ? """
+    cat /sys/fs/cgroup/memory.max || true
+    trap 'cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory.stat; ps -eo pid,ppid,sid,etimes,rss,args --sort=-rss | head -40' EXIT
+  """ : ''
+  // Jenkins exports the node's environment into the container, hiding the image's.
+  def dockerEnv = ['PATH+VENV=/opt/libtest-venv/bin',
+                   'PATH+CARGO=/opt/rust/cargo/bin',
+                   'CARGO_HOME=/opt/rust/cargo',
+                   'RUSTUP_HOME=/opt/rust/rustup']
+  // Runs a script in the image if the target uses one, on the node otherwise.
+  def runSh = { args ->
+    if (image) {
+      image.inside(dockerArgs) { withEnv(dockerEnv) { sh(args) } }
+    } else {
+      sh(args)
+    }
+  }
+
+  def simulators = fmiSimulators ?: []
+  FMI_TESTING_FLAG = ""
+  SOLVER_FLAG = (solvers ?: []).collect { " --solver=${it}" }.join('')
+  def omsSimulators = simulators.findAll { it.startsWith('OMSimulator') }
+  if (omsSimulators && omsHash) {
+    // In the image rather than on the node: test.py runs this binary from inside it, and one built
+    // against the node's libraries need not load there.
+    runSh("""
+    if ! test -d OMSimulator; then
+      git clone --recursive https://openmodelica.org/git-readonly/OMSimulator.git || exit 1
+    fi
+    cd OMSimulator || exit 1
+
+    git fetch || exit 1
+    git reset --hard "${omsHash}" || exit 1
+
+    git rev-parse HEAD > .newhash
+    echo "OMSimulator Hash: ${omsHash} and commit:"
+    cat .newhash || true
+    echo Old Hash:
+    cat ~/saved_omc/OMSimulator/.githash || true
+
+    # The second test rebuilds a cached build that does not run here: one made on
+    # the node before the job moved into a container, or against an older image,
+    # matches by hash but misses the libraries it was linked against.
+    if ! cmp ~/saved_omc/OMSimulator/.githash .newhash || ! ~/saved_omc/OMSimulator/install/bin/OMSimulator --version; then
+
+      git submodule sync --recursive || exit 1
+      git clean -ffdx || exit 1
+      git submodule update --init --recursive --force || exit 1
+      git submodule foreach --recursive  "git fetch --tags --force && git reset --hard && git clean -fdxq -e /git -e /svn" || exit 1
+      cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=install/
+      cmake --build build/ --target install || exit 1
+      ./install/bin/OMSimulator --version || exit 1
+      mkdir -p ~/saved_omc/OMSimulator || exit 1
+      cp -a * ~/saved_omc/OMSimulator/ || exit 1
+      git rev-parse HEAD > ~/saved_omc/OMSimulator/.githash || exit 1
+
+    fi
+    echo OMSimulator version:
+    ${env.HOME}/saved_omc/OMSimulator/install/bin/OMSimulator --version
+    """)
+    FMI_TESTING_FLAG = omsSimulators.collect { " --fmisimulator=${it}=${env.HOME}/saved_omc/OMSimulator/install/bin/OMSimulator" }.join('')
+  }
+
+  def fmpySimulators = simulators.findAll { it.startsWith('fmpy') }
+  if (fmpySimulators) {
+    // The version is the image's; check it in the interpreter test.py will reach rather than
+    // installing one over it, which in a container would be thrown away with the container.
+    runSh('python3 -m fmpy -h > /dev/null || exit 1')
+    FMI_TESTING_FLAG += fmpySimulators.collect { " --fmisimulator=${it}='python3 -m fmpy'" }.join('')
+  }
+
+  if (FMI_TESTING_FLAG) {
+    FMI_TESTING_FLAG = "--fmi=true${FMI_TESTING_FLAG} --fmuType=me_cs"
+  }
+
+  // A pull request is fetched from GitHub itself: refs/pull/* is not on the
+  // read-only mirror the rest of the job clones. The merge ref rather than the
+  // head one, since the question is what happens once it is merged, and it is
+  // checked out detached so that nothing is left behind for the next run of the
+  // same workspace to trip over.
+  def pullRequest = branch.startsWith('pr/') && branch.substring(3).isInteger() ? branch.substring(3) : ''
+  def checkoutRef = pullRequest ? """
+    REFS=`git ls-remote https://github.com/OpenModelica/OpenModelica.git "refs/pull/${pullRequest}/head" "refs/pull/${pullRequest}/merge"` || exit 1
+    case "\$REFS" in
+      *"refs/pull/${pullRequest}/merge"*)
+        PRREF="refs/pull/${pullRequest}/merge" ;;
+      *"refs/pull/${pullRequest}/head"*)
+        # GitHub only has a merge ref while it can merge the pull request into
+        # its base branch. Without one there is still something to test, only it
+        # is the pull request on its own rather than as it would land.
+        echo "WARNING: pull request ${pullRequest} has no merge ref: it conflicts with its base branch, or it is closed."
+        echo "WARNING: testing refs/pull/${pullRequest}/head, which does not have what was merged into the base branch since it was branched."
+        PRREF="refs/pull/${pullRequest}/head" ;;
+      *)
+        echo "OpenModelica/OpenModelica has no pull request ${pullRequest}."
+        exit 1 ;;
+    esac
+    echo "Testing \$PRREF"
+    git fetch --force https://github.com/OpenModelica/OpenModelica.git "\$PRREF" || exit 1
+    git checkout -f --detach FETCH_HEAD || exit 1
+    git fetch --tags --force || exit 1
+""" : """
+    git reset --hard && git checkout -f "${branch}" && (git rev-parse --verify "tags/${branch}"  || (git reset --hard "origin/${branch}" && git pull)) && git fetch --tags --force || exit 1
+"""
+
+  OMCPATH = "${omcompiler ? '../' : './'}OMCompiler"
+
+  def useCMake = buildsWithCMake(branch)
+  // The build runs in OMCompiler, one level below the cmake source tree.
+  if (useCMake && omcompiler) {
+    error 'cmake builds need the OMCompiler directory of the OpenModelica repository (omcompiler=false)'
+  }
+  if (cmakeFlags && !useCMake) {
+    error "${branch} is built with Autoconf and has no use for the cmake flags ${cmakeFlags}"
+  }
+  // Only the target sharing the compile cache of the OpenModelica job has something to look up in
+  // it; starting a server for the other cmake builds would just cost them the credentials and the
+  // startup.
+  def useSccache = cmakeFlags.contains('sccache')
+  // The build used to say -j9, the cores of the machine this file was written
+  // for in 2019, and -j16, the cores of the ryzen-5950x machines that replaced
+  // it - the commit that raised the others to 16 left the omc build at 9. Named
+  // buildJobs rather than jobs: that is this method's own parameter, how many
+  // models test.py tests at a time.
+  def buildJobs = numPhysicalCPU()
+  echo "Building omc with -j${buildJobs} on ${env.NODE_NAME}"
+
+  // Not -march=native: the nodes differ in microarchitecture and the shared sccache
+  // cannot tell two `-march=native` command lines apart (AVX-512 object -> SIGILL).
+  def buildOMC
+  if (useCMake) {
+    buildOMC = (useSccache ? sccachePreamble() : '') + """
+    cmake -S .. -B ../build_cmake -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX="`pwd`/build" \
+      -DCMAKE_C_COMPILER=clang \
+      -DCMAKE_CXX_COMPILER=clang++ \
+      -DCMAKE_Fortran_COMPILER=gfortran \
+      -DCMAKE_C_FLAGS=-march=x86-64-v3 \
+      -DCMAKE_CXX_FLAGS=-march=x86-64-v3 \
+      -DOM_USE_CCACHE=OFF \
+      -DOM_ENABLE_GUI_CLIENTS=OFF \
+      -DOM_ENABLE_OMSIMULATOR=OFF \
+      -DOM_OMC_ENABLE_CPP_RUNTIME=ON \
+      ${cmakeFlags} || exit 1
+    if ! time cmake --build ../build_cmake --parallel ${buildJobs} --target install > log 2>&1; then
+      cat log
+      exit 1
+    fi
+    build/bin/omc --version || exit 1
+    """ + (useSccache ? 'sccache --show-stats || true\n' : '')
+  } else {
+    // The maintenance branches only, see buildsWithCMake().
+    buildOMC = """
+    autoreconf --install
+    ./configure --with-cppruntime --without-omc --disable-modelica3d CC=clang CXX=clang++ FC=gfortran CFLAGS='-O2 -march=x86-64-v3' --with-omlibrary=all --with-omniORB
+    time make -j${buildJobs} clean
+    if ! time make -j${buildJobs} omc > log 2>&1; then
+      cat log
+      exit 1
+    fi
+    # master used to fail the build here and the other targets to carry on without a C++ runtime.
+    # Only the maintenance branches are left, so a failure is no longer fatal for anyone.
+    if ! time make -j${buildJobs} runtimeCPPinstall > log 2>&1; then
+      cat log
+      echo "Ignoring failed C++ runtime"
+    fi
+    """
+  }
+
+  sh '''
+  FREE=`df -k --output=avail "$PWD" | tail -n1`   # df -k not df -h
+  if test "$FREE" -lt 31457280; then               # 30G = 30*1024*1024k
+    echo "Less than 30 GB free disk space"
+    exit 1
+  fi;
+  '''
+
+  sh 'killall omc || true'
+
+  def checkoutAndBuild = """
+  if test ! -d OpenModelica; then
+    git clone --recursive https://openmodelica.org/git-readonly/OpenModelica.git OpenModelica
+  fi
+  if test ! -d OMCompiler; then
+    git clone --recursive https://openmodelica.org/git-readonly/OMCompiler.git OMCompiler
+  fi
+  if test ! -d OMLibraries; then
+    git clone --recursive https://openmodelica.org/git-readonly/OMLibraries.git OMLibraries
+  fi
+  cd OMLibraries
+  git fetch
+  git reset --hard origin/library-coverage
+
+  cd ../OpenModelica
+  git fetch
+  rm -rf OMCompiler # Make sure the old submodule is not there
+  git reset --hard origin/master
+  git clean -fdx
+
+  cd ${OMCPATH}
+
+  if ! test -f ~/saved_omc/${name}/.nogit; then
+    ${checkoutRef}
+    git submodule update --init --recursive --force || (rm -rf * && git reset --hard && git submodule update --init --recursive --force) || exit 1
+    git submodule foreach --recursive  "git fetch --tags --force && git reset --hard && git clean -fdxq -e /git -e /svn" || exit 1
+    git clean -fdxq || exit 1
+    git submodule status --recursive
+  fi
+
+  export OPENMODELICAHOME="`pwd`/build"
+
+  git rev-parse --verify HEAD > .newhash
+  # Part of the stamp rather than the commit alone: a build/ cached from the other build system, or
+  # with other cmake flags, is not what this job would produce for the same commit.
+  echo "${useCMake ? 'cmake' : 'autotools'}" >> .newhash
+  ${cmakeFlags ? "echo '${cmakeFlags}' >> .newhash" : ''}
+  echo New Hash:
+  cat .newhash
+  echo Old Hash:
+  cat ~/saved_omc/${name}/.githash || true
+  REBUILD=""
+  if cmp ~/saved_omc/${name}/.githash .newhash || test -f ~/saved_omc/${name}/.nogit; then
+    rsync -a --delete ~/saved_omc/${name}/ build/ || exit 1
+    echo "Restoring cached OMC version: ${name}, `cat ~/saved_omc/${name}/.githash`"
+    # The hash says the sources match, not that the binary runs here: a cache
+    # filled on the node before the jobs moved into a container, or before the
+    # image changed, holds an omc linked against libraries that are missing now.
+    # Without this check the run dies much later, when test.py asks the restored
+    # binary for its version and gets exit code 127.
+    if ! build/bin/omc --version; then
+      if test -f ~/saved_omc/${name}/.nogit; then
+        echo "The cached omc of ${name} does not run in this environment, and .nogit forbids rebuilding it."
+        exit 1
+      fi
+      echo "The cached omc of ${name} does not run in this environment; rebuilding it."
+      REBUILD=1
+    fi
+  else
+    REBUILD=1
+  fi
+  if test -n "\$REBUILD"; then
+    ${buildOMC}
+    rm -rf ~/saved_omc/${name}/
+    mkdir -p ~/saved_omc/${name}/
+    CMD="rsync -a --delete build/ \$HOME/saved_omc/${name}/"
+    echo \$CMD
+    \$CMD || exit 1
+    cp .newhash ~/saved_omc/${name}/.githash
+  fi
+  """
+
+  if (useSccache) {
+    withSccache { runSh(checkoutAndBuild) }
+  } else {
+    runSh(checkoutAndBuild)
+  }
+
+  runSh("""
+  cd OpenModelica
+  rm -rf "`pwd`/${OMCPATH}/build/lib/omlibrary/"
+  mkdir -p "`pwd`/${OMCPATH}/build/lib/omlibrary/"
+  # (cd ../OMLibraries && git rev-parse HEAD)
+  # if ! time make -j16 -C ../OMLibraries all BUILD_DIR="`pwd`/${OMCPATH}/build/lib/omlibrary/" > log 2>&1; then
+  #   cat log
+  #   exit 1
+  # fi
+  if ! time make -j${numLogicalCPU()} -C testsuite/ReferenceFiles > log 2>&1; then
+    cat log
+    exit 1
+  fi
+
+  cd ../
+  rm -rf Reference-modelica.org
+  ln -s /mnt/ReferenceFiles/modelica.org Reference-modelica.org
+  """)
+  // sh 'rsync -av modelica-ro:/files/RegressionTesting/ReferenceResults Reference-modelica.org || true # exit 1'
+
+  MSLREFERENCE="${WORKSPACE}/Reference-modelica.org/ReferenceResults"
+  REFERENCEFILES="${WORKSPACE}/OpenModelica/testsuite/ReferenceFiles"
+  GITREPOS="${WORKSPACE}/OpenModelica/libraries/git"
+  PNLIBREFS="/mnt/ReferenceFiles/PNlib/ReferenceFiles"
+  THERMOFLUIDSTREAMREFS="/mnt/ReferenceFiles/ThermofluidStream-main-regression/ReferenceData"
+  THERMOFLUIDSTREAMREFSOM="/mnt/ReferenceFiles/ThermofluidStream-OM-regression/ReferenceData"
+
+  sh """
+  test -f "${MSLREFERENCE}/MAP-LIB_ReferenceResults/v4.0.0/README.md" || exit 1
+
+  mkdir -p "/var/www/libraries.openmodelica.org/branches/${name}/"
+  """
+
+  def libraryPath = installLibraries(removePackageOrder, conversionScript, name, "${WORKSPACE}/OpenModelica/${OMCPATH}/build", runSh)
+
+  sh "test -d '${libraryPath}/.openmodelica/libraries/Modelica trunk'"
+
+  sh 'date'
+
+  // The password of the results database comes from a secret file, bound here
+  // rather than for the pipeline as a whole: writing the file needs the
+  // workspace of a node, and the pipeline has agent none.
+  withCredentials([file(credentialsId: 'omdb-pgpass', variable: 'PGPASSFILE')]) {
+    runSh("""
+    export OPENMODELICAHOME="${WORKSPACE}/OpenModelica/${OMCPATH}/build"
+    export MSLREFERENCE="${MSLREFERENCE}"
+    export REFERENCEFILES="${REFERENCEFILES}"
+    export GITREPOS="${GITREPOS}"
+    export PNLIBREFS="${PNLIBREFS}"
+    export THERMOFLUIDSTREAMREFS="${THERMOFLUIDSTREAMREFS}"
+    export THERMOFLUIDSTREAMREFSOM="${THERMOFLUIDSTREAMREFSOM}"
+    export PREVIOUSHOME="${env.HOME}"
+    export HOME="${libraryPath}"
+    # we need to do some crap magic here to make sure python3 finds fmpy as we change the HOME here
+    # too bad if we cannot do it, just continue
+    ln -s -t \${HOME} \${PREVIOUSHOME}/.local .local || true
+
+    ${cgroupReport}
+    cd OpenModelicaLibraryTesting
+    # Force /usr/bin/omc as being used for generating the mos-files. Ensures consistent behavior among all tested OMC versions
+    PYTHONUNBUFFERED=1 stdbuf -oL -eL time ./test.py --ompython_omhome=/usr ${FMI_TESTING_FLAG}${SOLVER_FLAG} --extraflags='${extraFlags}' --extrasimflags='${extrasimflags}' ${testFlags} --branch="${name}" --output="libraries.openmodelica.org:/var/www/libraries.openmodelica.org/branches/${name}/" --libraries='${libraryPath}/.openmodelica/libraries/'  --jobs=${jobs} ${libs_config_file} ${params.OLDLIBS ? "configs/conf-old.json configs/conf-nonstandard.json" : ""} || (killall omc ; false) || exit 1
+    """)
+    sh 'date'
+  }
+
+}
